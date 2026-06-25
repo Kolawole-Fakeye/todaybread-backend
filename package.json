@@ -1,0 +1,22 @@
+{
+  "name": "todaybread-backend",
+  "version": "1.0.0",
+  "description": "TodayBread backend — inventory, sales, sync, reports, and WhatsApp summary",
+  "main": "main.js",
+  "scripts": {
+    "start": "node main.js",
+    "migrate": "node main.js migrate"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "jsonwebtoken": "^9.0.2",
+    "node-cron": "^3.0.3",
+    "pg": "^8.11.5"
+  }
+}
