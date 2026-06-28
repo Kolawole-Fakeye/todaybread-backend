@@ -298,7 +298,7 @@ app.get('/auth/staff', requireAuth, requireOwner, async (req, res) => {
 
 // GET /me — who's logged in and which business they belong to (frontend uses this right after login)
 app.get('/me', requireAuth, async (req, res) => {
-  const business = await pool.query('SELECT id, name, whatsapp_number, created_at FROM businesses WHERE id = $1', [req.user.businessId]);
+  const business = await pool.query('SELECT id, name, address, whatsapp_number, created_at FROM businesses WHERE id = $1', [req.user.businessId]);
   res.json({
     user: { id: req.user.userId, name: req.user.name, role: req.user.role },
     business: business.rows[0] || null,
