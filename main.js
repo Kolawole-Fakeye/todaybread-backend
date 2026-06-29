@@ -307,9 +307,14 @@ app.get('/me', requireAuth, async (req, res) => {
 
 // --- INVENTORY ---
 app.get('/inventory', requireAuth, async (req, res) => {
-  const result = await pool.query('SELECT * FROM inventory_items WHERE business_id = $1 ORDER BY category, name', [req.user.businessId]);
-  const items = req.user.role === 'owner' ? result.rows : result.rows.map(({ cost_price, ...rest }) => rest);
-  res.json({ items });
+  try {
+    const result = await pool.query('SELECT * FROM inventory_items WHERE business_id = $1 ORDER BY category, name', [req.user.businessId]);
+    const items = req.user.role === 'owner' ? result.rows : result.rows.map(({ cost_price, ...rest }) => rest);
+    res.json({ items });
+  } catch (err) {
+    console.error('[/inventory] error:', err.message);
+    res.status(500).json({ error: 'Could not load inventory right now, please retry' });
+  }
 });
 
 app.post('/inventory', requireAuth, requireOwner, async (req, res) => {
@@ -421,16 +426,21 @@ app.post('/sales/sync', requireAuth, async (req, res) => {
 });
 
 app.get('/sales', requireAuth, async (req, res) => {
-  const { since, until } = req.query;
-  const conditions = ['business_id = $1']; const values = [req.user.businessId]; let i = 2;
-  if (since) { conditions.push(`occurred_at >= $${i++}`); values.push(since); }
-  if (until) { conditions.push(`occurred_at <= $${i++}`); values.push(until); }
-  const result = await pool.query(
-    `SELECT s.*, i.name AS item_name, i.category FROM sales s JOIN inventory_items i ON i.id = s.item_id
-     WHERE ${conditions.join(' AND ')} ORDER BY occurred_at DESC`,
-    values
-  );
-  res.json({ sales: result.rows });
+  try {
+    const { since, until } = req.query;
+    const conditions = ['business_id = $1']; const values = [req.user.businessId]; let i = 2;
+    if (since) { conditions.push(`occurred_at >= $${i++}`); values.push(since); }
+    if (until) { conditions.push(`occurred_at <= $${i++}`); values.push(until); }
+    const result = await pool.query(
+      `SELECT s.*, i.name AS item_name, i.category FROM sales s JOIN inventory_items i ON i.id = s.item_id
+       WHERE ${conditions.join(' AND ')} ORDER BY occurred_at DESC`,
+      values
+    );
+    res.json({ sales: result.rows });
+  } catch (err) {
+    console.error('[/sales] error:', err.message);
+    res.status(500).json({ error: 'Could not load sales right now, please retry' });
+  }
 });
 
 // --- REPORTS / INSIGHTS ---
