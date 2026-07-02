@@ -428,12 +428,12 @@ app.post('/sales/sync', requireAuth, async (req, res) => {
 app.get('/sales', requireAuth, async (req, res) => {
   try {
     const { since, until } = req.query;
-    const conditions = ['business_id = $1']; const values = [req.user.businessId]; let i = 2;
-    if (since) { conditions.push(`occurred_at >= $${i++}`); values.push(since); }
-    if (until) { conditions.push(`occurred_at <= $${i++}`); values.push(until); }
+    const conditions = ['s.business_id = $1']; const values = [req.user.businessId]; let i = 2;
+    if (since) { conditions.push(`s.occurred_at >= $${i++}`); values.push(since); }
+    if (until) { conditions.push(`s.occurred_at <= $${i++}`); values.push(until); }
     const result = await pool.query(
       `SELECT s.*, i.name AS item_name, i.category FROM sales s JOIN inventory_items i ON i.id = s.item_id
-       WHERE ${conditions.join(' AND ')} ORDER BY occurred_at DESC`,
+       WHERE ${conditions.join(' AND ')} ORDER BY s.occurred_at DESC`,
       values
     );
     res.json({ sales: result.rows });
