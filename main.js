@@ -297,6 +297,31 @@ app.get('/auth/staff', requireAuth, requireOwner, async (req, res) => {
 });
 
 // GET /me — who's logged in and which business they belong to (frontend uses this right after login)
+// POST /auth/reset-pin — owner resets a staff member's PIN, or any user resets their own
+app.post('/auth/reset-pin', requireAuth, async (req, res) => {
+  const { userId, newPin } = req.body;
+  if (!newPin || newPin.length < 4) return res.status(400).json({ error: 'New PIN must be at least 4 digits' });
+
+  // owner can reset any staff in their business; staff can only reset themselves
+  const targetId = userId || req.user.userId;
+  if (targetId !== req.user.userId && req.user.role !== 'owner') {
+    return res.status(403).json({ error: 'Only the owner can reset another user\'s PIN' });
+  }
+
+  try {
+    // confirm the target user belongs to the same business
+    const check = await pool.query('SELECT id FROM users WHERE id = $1 AND business_id = $2', [targetId, req.user.businessId]);
+    if (check.rows.length === 0) return res.status(404).json({ error: 'User not found in this business' });
+
+    const pinHash = await bcrypt.hash(String(newPin), 10);
+    await pool.query('UPDATE users SET pin_hash = $1 WHERE id = $2', [pinHash, targetId]);
+    res.json({ reset: true });
+  } catch (err) {
+    console.error('[/auth/reset-pin] error:', err.message);
+    res.status(500).json({ error: 'Could not reset PIN' });
+  }
+});
+
 app.get('/me', requireAuth, async (req, res) => {
   const business = await pool.query('SELECT id, name, address, whatsapp_number, created_at FROM businesses WHERE id = $1', [req.user.businessId]);
   res.json({
@@ -309,7 +334,9 @@ app.get('/me', requireAuth, async (req, res) => {
 app.get('/inventory', requireAuth, async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM inventory_items WHERE business_id = $1 ORDER BY category, name', [req.user.businessId]);
-    const items = req.user.role === 'owner' ? result.rows : result.rows.map(({ cost_price, ...rest }) => rest);
+    const items = req.user.role === 'owner'
+      ? result.rows
+      : result.rows.map(({ cost_price, warehouse_stock, ...rest }) => rest); // staff don't see cost or warehouse
     res.json({ items });
   } catch (err) {
     console.error('[/inventory] error:', err.message);
@@ -318,13 +345,13 @@ app.get('/inventory', requireAuth, async (req, res) => {
 });
 
 app.post('/inventory', requireAuth, requireOwner, async (req, res) => {
-  const { sku, name, size, category, costPrice, salePrice, stock, reorderLevel, origin } = req.body;
+  const { sku, name, size, category, costPrice, salePrice, stock, warehouseStock, reorderLevel, origin, brand } = req.body;
   if (!sku || !name) return res.status(400).json({ error: 'sku and name are required' });
   try {
     const result = await pool.query(
-      `INSERT INTO inventory_items (business_id, sku, name, size, category, cost_price, sale_price, stock, reorder_level, origin)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
-      [req.user.businessId, sku, name, size, category, costPrice || 0, salePrice || 0, stock || 0, reorderLevel || 0, origin]
+      `INSERT INTO inventory_items (business_id, sku, name, size, category, brand, cost_price, sale_price, stock, warehouse_stock, reorder_level, origin)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
+      [req.user.businessId, sku, name, size, category, brand || '', costPrice || 0, salePrice || 0, stock || 0, warehouseStock || 0, reorderLevel || 0, origin]
     );
     res.status(201).json({ item: result.rows[0] });
   } catch (err) {
@@ -335,8 +362,8 @@ app.post('/inventory', requireAuth, requireOwner, async (req, res) => {
 });
 
 app.put('/inventory/:id', requireAuth, requireOwner, async (req, res) => {
-  const fields = ['name', 'size', 'category', 'cost_price', 'sale_price', 'stock', 'reorder_level', 'origin'];
-  const map = { costPrice: 'cost_price', salePrice: 'sale_price', reorderLevel: 'reorder_level' };
+  const fields = ['name', 'size', 'category', 'brand', 'cost_price', 'sale_price', 'stock', 'warehouse_stock', 'reorder_level', 'origin'];
+  const map = { costPrice: 'cost_price', salePrice: 'sale_price', reorderLevel: 'reorder_level', warehouseStock: 'warehouse_stock' };
   const updates = []; const values = []; let i = 1;
   for (const [key, val] of Object.entries(req.body)) {
     const col = map[key] || key;
