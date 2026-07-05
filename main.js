@@ -668,6 +668,112 @@ app.post('/internal/run-daily-summary-now', async (req, res) => {
   res.json({ triggered: true });
 });
 
+// ============================================================================
+// SUPER ADMIN ENDPOINTS — only accessible by users with is_super_admin = true
+// ============================================================================
+
+async function requireSuperAdmin(req, res, next) {
+  if (!req.user) return res.status(401).json({ error: 'Not authenticated' });
+  try {
+    const result = await pool.query('SELECT is_super_admin FROM users WHERE id = $1', [req.user.userId]);
+    if (!result.rows[0]?.is_super_admin) return res.status(403).json({ error: 'Super admin access required' });
+    next();
+  } catch (err) {
+    res.status(500).json({ error: 'Could not verify admin access' });
+  }
+}
+
+// GET /admin/stats — platform-wide numbers
+app.get('/admin/stats', requireAuth, requireSuperAdmin, async (req, res) => {
+  try {
+    const [businesses, users, sales, items] = await Promise.all([
+      pool.query('SELECT count(*) FROM businesses'),
+      pool.query('SELECT count(*) FROM users'),
+      pool.query('SELECT count(*), COALESCE(SUM(qty * unit_price), 0) AS total_revenue FROM sales'),
+      pool.query('SELECT count(*) FROM inventory_items'),
+    ]);
+    res.json({
+      totalBusinesses: Number(businesses.rows[0].count),
+      totalUsers: Number(users.rows[0].count),
+      totalSales: Number(sales.rows[0].count),
+      totalRevenue: Number(sales.rows[0].total_revenue),
+      totalItems: Number(items.rows[0].count),
+    });
+  } catch (err) {
+    console.error('[/admin/stats]', err.message);
+    res.status(500).json({ error: 'Could not load platform stats' });
+  }
+});
+
+// GET /admin/businesses — all businesses with per-business stats
+app.get('/admin/businesses', requireAuth, requireSuperAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        b.id, b.name, b.address, b.whatsapp_number, b.created_at,
+        u.name AS owner_name, u.phone AS owner_phone,
+        COUNT(DISTINCT i.id) AS item_count,
+        COUNT(DISTINCT s.id) AS sale_count,
+        COALESCE(SUM(s.qty * s.unit_price), 0) AS total_revenue,
+        MAX(s.occurred_at) AS last_sale_at,
+        COUNT(DISTINCT us.id) AS staff_count
+      FROM businesses b
+      LEFT JOIN users u ON u.business_id = b.id AND u.role = 'owner'
+      LEFT JOIN inventory_items i ON i.business_id = b.id
+      LEFT JOIN sales s ON s.business_id = b.id
+      LEFT JOIN users us ON us.business_id = b.id AND us.role = 'staff'
+      GROUP BY b.id, b.name, b.address, b.whatsapp_number, b.created_at, u.name, u.phone
+      ORDER BY b.created_at DESC
+    `);
+    res.json({ businesses: result.rows });
+  } catch (err) {
+    console.error('[/admin/businesses]', err.message);
+    res.status(500).json({ error: 'Could not load businesses' });
+  }
+});
+
+// GET /admin/businesses/:id — single business detail
+app.get('/admin/businesses/:id', requireAuth, requireSuperAdmin, async (req, res) => {
+  try {
+    const [biz, staff, recentSales, topItems] = await Promise.all([
+      pool.query(`
+        SELECT b.*, u.name AS owner_name, u.phone AS owner_phone
+        FROM businesses b
+        LEFT JOIN users u ON u.business_id = b.id AND u.role = 'owner'
+        WHERE b.id = $1
+      `, [req.params.id]),
+      pool.query('SELECT name, phone FROM users WHERE business_id = $1 AND role = $2', [req.params.id, 'staff']),
+      pool.query(`
+        SELECT s.qty, s.unit_price, s.occurred_at, i.name AS item_name
+        FROM sales s JOIN inventory_items i ON i.id = s.item_id
+        WHERE s.business_id = $1 ORDER BY s.occurred_at DESC LIMIT 10
+      `, [req.params.id]),
+      pool.query(`
+        SELECT i.name, i.brand, i.stock, i.sale_price, COUNT(s.id) AS times_sold
+        FROM inventory_items i
+        LEFT JOIN sales s ON s.item_id = i.id
+        WHERE i.business_id = $1
+        GROUP BY i.id ORDER BY times_sold DESC LIMIT 5
+      `, [req.params.id]),
+    ]);
+    if (!biz.rows[0]) return res.status(404).json({ error: 'Business not found' });
+    res.json({ business: biz.rows[0], staff: staff.rows, recentSales: recentSales.rows, topItems: topItems.rows });
+  } catch (err) {
+    console.error('[/admin/businesses/:id]', err.message);
+    res.status(500).json({ error: 'Could not load business detail' });
+  }
+});
+
+// GET /admin/check — used by the frontend to detect super admin login
+app.get('/admin/check', requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT is_super_admin FROM users WHERE id = $1', [req.user.userId]);
+    res.json({ isSuperAdmin: !!result.rows[0]?.is_super_admin });
+  } catch (err) {
+    res.json({ isSuperAdmin: false });
+  }
+});
+
 app.use((err, req, res, next) => {
   console.error(err);
   res.status(500).json({ error: 'Internal server error' });
