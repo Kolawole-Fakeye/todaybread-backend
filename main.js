@@ -231,9 +231,17 @@ function generateSlug(name) {
 }
 
 app.post('/auth/signup', async (req, res) => {
-  const { businessName, ownerName, phone, pin, whatsappNumber, address } = req.body;
+  const { businessName, ownerName, phone, pin, whatsappNumber, address, inviteCode } = req.body;
   if (!businessName || !ownerName || !phone || !pin) {
     return res.status(400).json({ error: 'businessName, ownerName, phone, and pin are required' });
+  }
+
+  // Invite code gate — only checked if INVITE_CODE env var is set
+  const requiredCode = process.env.INVITE_CODE;
+  if (requiredCode) {
+    if (!inviteCode || inviteCode.trim().toUpperCase() !== requiredCode.toUpperCase()) {
+      return res.status(403).json({ error: 'Invalid invite code. Contact TodayBread to get access.' });
+    }
   }
   const client = await pool.connect();
   try {
