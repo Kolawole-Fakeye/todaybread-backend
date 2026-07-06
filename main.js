@@ -225,17 +225,27 @@ app.use(express.json());
 app.get('/health', (req, res) => res.json({ ok: true }));
 
 // --- AUTH ---
+function generateSlug(name) {
+  const base = name.toLowerCase().replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
+  return base || 'shop-' + Date.now();
+}
+
 app.post('/auth/signup', async (req, res) => {
-  const { businessName, ownerName, phone, pin, whatsappNumber } = req.body;
+  const { businessName, ownerName, phone, pin, whatsappNumber, address } = req.body;
   if (!businessName || !ownerName || !phone || !pin) {
     return res.status(400).json({ error: 'businessName, ownerName, phone, and pin are required' });
   }
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    // Generate a unique slug
+    let slug = generateSlug(businessName);
+    const existing = await client.query('SELECT id FROM businesses WHERE slug = $1', [slug]);
+    if (existing.rows.length > 0) slug = slug + '-' + Date.now();
+
     const biz = await client.query(
-      'INSERT INTO businesses (name, whatsapp_number) VALUES ($1, $2) RETURNING *',
-      [businessName, whatsappNumber || phone]
+      'INSERT INTO businesses (name, whatsapp_number, address, slug) VALUES ($1, $2, $3, $4) RETURNING *',
+      [businessName, whatsappNumber || phone, address || null, slug]
     );
     const pinHash = await bcrypt.hash(pin, 10);
     const userRes = await client.query(
@@ -254,6 +264,46 @@ app.post('/auth/signup', async (req, res) => {
     client.release();
   }
 });
+
+// Public catalogue endpoint — no auth required
+app.get('/catalogue/:slug', async (req, res) => {
+  try {
+    const bizResult = await pool.query(
+      'SELECT id, name, address, whatsapp_number, slug FROM businesses WHERE slug = $1',
+      [req.params.slug]
+    );
+    if (!bizResult.rows[0]) return res.status(404).json({ error: 'Business not found' });
+    const business = bizResult.rows[0];
+    const itemsResult = await pool.query(
+      `SELECT name, brand, category, size, sale_price, origin
+       FROM inventory_items
+       WHERE business_id = $1 AND is_public = true AND stock > 0
+       ORDER BY category, name`,
+      [business.id]
+    );
+    res.json({ business, items: itemsResult.rows });
+  } catch (err) {
+    console.error('[/catalogue/:slug]', err.message);
+    res.status(500).json({ error: 'Could not load catalogue' });
+  }
+});
+
+// PATCH /inventory/:id/visibility — owner toggles public/private per item
+app.patch('/inventory/:id/visibility', requireAuth, requireOwner, async (req, res) => {
+  const { isPublic } = req.body;
+  try {
+    const result = await pool.query(
+      'UPDATE inventory_items SET is_public = $1, updated_at = now() WHERE id = $2 AND business_id = $3 RETURNING id, is_public',
+      [!!isPublic, req.params.id, req.user.businessId]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: 'Item not found' });
+    res.json({ id: result.rows[0].id, isPublic: result.rows[0].is_public });
+  } catch (err) {
+    console.error('[/inventory/visibility]', err.message);
+    res.status(500).json({ error: 'Could not update visibility' });
+  }
+});
+
 
 app.post('/auth/login', async (req, res) => {
   const { phone, pin } = req.body;
