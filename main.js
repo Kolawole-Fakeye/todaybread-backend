@@ -832,6 +832,35 @@ app.get('/admin/check', requireAuth, async (req, res) => {
   }
 });
 
+// GET /admin/pin-resets — list users who requested a PIN reset
+app.get('/admin/pin-resets', requireAuth, requireSuperAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT u.id, u.name, u.phone, b.name AS business_name
+      FROM users u
+      LEFT JOIN businesses b ON b.id = u.business_id
+      WHERE u.pin_reset_requested = true
+      ORDER BY u.name
+    `);
+    res.json({ resets: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: 'Could not load reset requests' });
+  }
+});
+
+// POST /admin/pin-resets/:userId/resolve — super admin resets a user's PIN
+app.post('/admin/pin-resets/:userId/resolve', requireAuth, requireSuperAdmin, async (req, res) => {
+  const { newPin } = req.body;
+  if (!newPin || newPin.length < 4) return res.status(400).json({ error: 'New PIN must be at least 4 digits' });
+  try {
+    const pinHash = await bcrypt.hash(String(newPin), 10);
+    await pool.query('UPDATE users SET pin_hash = $1, pin_reset_requested = false WHERE id = $2', [pinHash, req.params.userId]);
+    res.json({ resolved: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Could not resolve PIN reset' });
+  }
+});
+
 app.use((err, req, res, next) => {
   console.error(err);
   res.status(500).json({ error: 'Internal server error' });
