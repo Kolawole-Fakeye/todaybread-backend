@@ -744,18 +744,31 @@ async function requireSuperAdmin(req, res, next) {
 // GET /admin/stats — platform-wide numbers
 app.get('/admin/stats', requireAuth, requireSuperAdmin, async (req, res) => {
   try {
-    const [businesses, users, sales, items] = await Promise.all([
+    const sevenDaysAgo = new Date();
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+
+    const [businesses, users, sales, items, activeBusinesses, ghostBusinesses, recentSignups] = await Promise.all([
       pool.query('SELECT count(*) FROM businesses'),
       pool.query('SELECT count(*) FROM users'),
       pool.query('SELECT count(*), COALESCE(SUM(qty * unit_price), 0) AS total_revenue FROM sales'),
       pool.query('SELECT count(*) FROM inventory_items'),
+      // Active: had at least one sale in the last 7 days
+      pool.query(`SELECT count(DISTINCT business_id) FROM sales WHERE occurred_at >= $1`, [sevenDaysAgo]),
+      // Ghost: signed up but never recorded a single sale
+      pool.query(`SELECT count(*) FROM businesses b WHERE NOT EXISTS (SELECT 1 FROM sales s WHERE s.business_id = b.id)`),
+      // New signups in last 7 days
+      pool.query(`SELECT count(*) FROM businesses WHERE created_at >= $1`, [sevenDaysAgo]),
     ]);
+
     res.json({
       totalBusinesses: Number(businesses.rows[0].count),
       totalUsers: Number(users.rows[0].count),
       totalSales: Number(sales.rows[0].count),
       totalRevenue: Number(sales.rows[0].total_revenue),
       totalItems: Number(items.rows[0].count),
+      activeBusinesses: Number(activeBusinesses.rows[0].count),
+      ghostBusinesses: Number(ghostBusinesses.rows[0].count),
+      recentSignups: Number(recentSignups.rows[0].count),
     });
   } catch (err) {
     console.error('[/admin/stats]', err.message);
