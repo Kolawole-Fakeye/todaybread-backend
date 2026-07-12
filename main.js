@@ -129,38 +129,35 @@ function requireOwner(req, res, next) {
 // ----------------------------------------------------------------------------
 function naira(n) { return '₦' + Math.round(n).toLocaleString('en-NG'); }
 
-async function sendWhatsAppTemplate(toNumber, params) {
-  const token = process.env.WHATSAPP_TOKEN;
-  const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID;
-  const templateName = process.env.WHATSAPP_TEMPLATE_NAME || 'daily_summary';
+async function sendWhatsAppMessage(toNumber, messageBody) {
+  const accountSid = process.env.TWILIO_ACCOUNT_SID;
+  const authToken = process.env.TWILIO_AUTH_TOKEN;
+  const from = process.env.TWILIO_WHATSAPP_FROM || 'whatsapp:+14155238886';
 
-  if (!token || !phoneNumberId) {
-    console.warn('[whatsapp] credentials not set — skipping send. Params were:', params);
+  if (!accountSid || !authToken) {
+    console.warn('[whatsapp] Twilio credentials not set — skipping send');
     return { skipped: true };
   }
 
-  const url = `https://graph.facebook.com/v19.0/${phoneNumberId}/messages`;
-  const body = {
-    messaging_product: 'whatsapp',
-    to: toNumber,
-    type: 'template',
-    template: {
-      name: templateName,
-      language: { code: 'en_US' },
-      components: [{ type: 'body', parameters: params.map((text) => ({ type: 'text', text: String(text) })) }],
-    },
-  };
+  const to = toNumber.startsWith('whatsapp:') ? toNumber : `whatsapp:+${toNumber.replace(/^\+/, '')}`;
+  const url = `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`;
+  const body = new URLSearchParams({ From: from, To: to, Body: messageBody });
 
   const res = await fetch(url, {
     method: 'POST',
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
+    headers: {
+      Authorization: 'Basic ' + Buffer.from(`${accountSid}:${authToken}`).toString('base64'),
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: body.toString(),
   });
+
   const data = await res.json();
   if (!res.ok) {
-    console.error('[whatsapp] send failed:', data);
-    throw new Error(data?.error?.message || 'WhatsApp send failed');
+    console.error('[whatsapp] Twilio send failed:', data);
+    throw new Error(data?.message || 'WhatsApp send failed');
   }
+  console.log('[whatsapp] sent successfully, SID:', data.sid);
   return data;
 }
 
@@ -196,10 +193,17 @@ async function runDailySummaries() {
   for (const business of businesses.rows) {
     try {
       const summary = await buildDailySummary(business.id);
-      const dashboardUrl = process.env.DASHBOARD_URL || 'https://your-app-url.com';
-      await sendWhatsAppTemplate(business.whatsapp_number, [
-        business.name, naira(summary.revenue), summary.topSellerName, summary.lowStockCount, dashboardUrl,
-      ]);
+      const dashboardUrl = process.env.DASHBOARD_URL || 'https://dapper-sable-ed0d32.netlify.app';
+
+      const message =
+        `📋 *TodayBread Daily Summary*\n` +
+        `*${business.name}*\n\n` +
+        `💰 Revenue today: *${naira(summary.revenue)}*\n` +
+        `🏆 Best seller: *${summary.topSellerName}*\n` +
+        `⚠️ Low stock alerts: *${summary.lowStockCount} item${summary.lowStockCount === 1 ? '' : 's'}*\n\n` +
+        `👉 View dashboard: ${dashboardUrl}`;
+
+      await sendWhatsAppMessage(business.whatsapp_number, message);
       console.log(`[whatsapp] daily summary sent for ${business.name}`);
     } catch (err) {
       console.error(`[whatsapp] failed for business ${business.id}:`, err.message);
@@ -724,6 +728,18 @@ app.post('/ocr/commit', requireAuth, async (req, res) => {
 app.post('/internal/run-daily-summary-now', async (req, res) => {
   await runDailySummaries();
   res.json({ triggered: true });
+});
+
+// Quick test — sends a single WhatsApp message to TWILIO_WHATSAPP_TO to verify credentials
+app.post('/internal/test-whatsapp', async (req, res) => {
+  const to = process.env.TWILIO_WHATSAPP_TO;
+  if (!to) return res.status(400).json({ error: 'TWILIO_WHATSAPP_TO not set in environment' });
+  try {
+    const result = await sendWhatsAppMessage(to, '✅ TodayBread WhatsApp is working! Your daily summaries will arrive at 9 PM Lagos time.');
+    res.json({ success: true, sid: result.sid });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ============================================================================
