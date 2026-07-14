@@ -266,6 +266,25 @@ app.post('/auth/signup', async (req, res) => {
     );
     await client.query('COMMIT');
     const owner = userRes.rows[0];
+
+    // Send welcome WhatsApp message (non-blocking — signup succeeds even if message fails)
+    const catalogueUrl = `${process.env.DASHBOARD_URL || 'https://todaybread.netlify.app'}`;
+    const shopUrl = `https://todaybread.onrender.com/shop/${biz.rows[0].slug}`;
+    const welcomeMsg =
+      `👋 Welcome to *TodayBread*, ${businessName}!\n\n` +
+      `Your shop is now live. Here's what to do next:\n\n` +
+      `1️⃣ Open your dashboard: ${catalogueUrl}\n` +
+      `2️⃣ Add your inventory so customers can see your products\n` +
+      `3️⃣ Share your public catalogue with customers: ${shopUrl}\n\n` +
+      `Every evening at 9 PM you'll receive a daily summary of your sales right here on WhatsApp.\n\n` +
+      `Need help? Reply to this message anytime.\n` +
+      `— TodayBread Team`;
+
+    const recipientNumber = whatsappNumber || phone;
+    sendWhatsAppMessage(recipientNumber, welcomeMsg).catch(err =>
+      console.error('[welcome-msg] failed for', businessName, err.message)
+    );
+
     res.status(201).json({ token: signToken(owner), business: biz.rows[0], user: { id: owner.id, name: owner.name, role: owner.role } });
   } catch (err) {
     await client.query('ROLLBACK');
