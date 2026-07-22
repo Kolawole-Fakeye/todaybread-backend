@@ -425,14 +425,73 @@ app.get('/inventory', requireAuth, async (req, res) => {
   }
 });
 
+// GET /inventory/categories — every category currently in use by this business,
+// derived straight from their own items (no shared/global list, no hardcoded
+// auto-parts categories). A brand-new tenant with no items yet just gets [].
+app.get('/inventory/categories', requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT category, count(*)::int AS item_count
+       FROM inventory_items
+       WHERE business_id = $1 AND category IS NOT NULL AND category <> ''
+       GROUP BY category
+       ORDER BY category ASC`,
+      [req.user.businessId]
+    );
+    res.json({ categories: result.rows });
+  } catch (err) {
+    console.error('[/inventory/categories] error:', err.message);
+    res.status(500).json({ error: 'Could not load categories' });
+  }
+});
+
+// PATCH /inventory/categories/rename — owner renames a category across every
+// item that currently uses it in one shot (e.g. "Brake Fluid" -> "Fluids").
+app.patch('/inventory/categories/rename', requireAuth, requireOwner, async (req, res) => {
+  const { from, to } = req.body;
+  if (!from || !to || !to.trim()) return res.status(400).json({ error: 'from and to are required' });
+  try {
+    const result = await pool.query(
+      `UPDATE inventory_items SET category = $1, updated_at = now()
+       WHERE business_id = $2 AND category = $3 RETURNING id`,
+      [to.trim(), req.user.businessId, from]
+    );
+    res.json({ renamed: true, itemsUpdated: result.rows.length });
+  } catch (err) {
+    console.error('[/inventory/categories/rename] error:', err.message);
+    res.status(500).json({ error: 'Could not rename category' });
+  }
+});
+
+// DELETE /inventory/categories/:name — clears that category off every item
+// that has it (items aren't deleted, they just become uncategorized).
+app.delete('/inventory/categories/:name', requireAuth, requireOwner, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE inventory_items SET category = NULL, updated_at = now()
+       WHERE business_id = $1 AND category = $2 RETURNING id`,
+      [req.user.businessId, req.params.name]
+    );
+    res.json({ cleared: true, itemsUpdated: result.rows.length });
+  } catch (err) {
+    console.error('[/inventory/categories/:name] error:', err.message);
+    res.status(500).json({ error: 'Could not clear category' });
+  }
+});
+
 app.post('/inventory', requireAuth, requireOwner, async (req, res) => {
   const { sku, name, size, category, costPrice, salePrice, stock, warehouseStock, reorderLevel, origin, brand } = req.body;
   if (!sku || !name) return res.status(400).json({ error: 'sku and name are required' });
   try {
+    // Category is free-form text, owned by the tenant — whatever the owner types
+    // when adding an item becomes a real category immediately, no fixed list
+    // to update, no approval step. Trim it so "Skincare " and "Skincare" don't
+    // silently become two different categories.
+    const cleanCategory = category && category.trim() ? category.trim() : null;
     const result = await pool.query(
       `INSERT INTO inventory_items (business_id, sku, name, size, category, brand, cost_price, sale_price, stock, warehouse_stock, reorder_level, origin)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
-      [req.user.businessId, sku, name, size, category, brand || '', costPrice || 0, salePrice || 0, stock || 0, warehouseStock || 0, reorderLevel || 0, origin]
+      [req.user.businessId, sku, name, size, cleanCategory, brand || '', costPrice || 0, salePrice || 0, stock || 0, warehouseStock || 0, reorderLevel || 0, origin]
     );
     res.status(201).json({ item: result.rows[0] });
   } catch (err) {
@@ -448,7 +507,11 @@ app.put('/inventory/:id', requireAuth, requireOwner, async (req, res) => {
   const updates = []; const values = []; let i = 1;
   for (const [key, val] of Object.entries(req.body)) {
     const col = map[key] || key;
-    if (fields.includes(col)) { updates.push(`${col} = $${i++}`); values.push(val); }
+    if (fields.includes(col)) {
+      // Same trim-and-empty-to-null treatment as create, so edits stay consistent
+      const cleanVal = col === 'category' && typeof val === 'string' ? (val.trim() || null) : val;
+      updates.push(`${col} = $${i++}`); values.push(cleanVal);
+    }
   }
   if (updates.length === 0) return res.status(400).json({ error: 'No valid fields to update' });
   values.push(req.params.id, req.user.businessId);
@@ -641,11 +704,41 @@ function fuzzyMatchItem(description, inventory) {
 }
 
 app.post('/ocr/parse-page', requireAuth, async (req, res) => {
-  const { imageBase64, mediaType } = req.body;
-  if (!imageBase64) return res.status(400).json({ error: 'imageBase64 is required' });
+  const { imageBase64, mediaType, text: pastedText } = req.body;
+  const hasImage = !!imageBase64;
+  const hasText = !!(pastedText && pastedText.trim());
+  if (!hasImage && !hasText) {
+    return res.status(400).json({ error: 'Provide either imageBase64 (photo) or text (pasted ledger text)' });
+  }
+  const MAX_PASTE_CHARS = 8000; // generous for a full day's ledger, cheap guard against runaway pastes
+  if (hasText && pastedText.length > MAX_PASTE_CHARS) {
+    return res.status(400).json({ error: `Pasted text is too long (${pastedText.length} characters, max ${MAX_PASTE_CHARS}) — split it into smaller batches` });
+  }
   if (!process.env.ANTHROPIC_API_KEY) {
     return res.status(500).json({ error: 'ANTHROPIC_API_KEY is not configured on the server' });
   }
+
+  // Every business writes their sales/stock ledger differently — some list
+  // "item — qty — price", some do "qty x item @unit price", some just
+  // scrawl shorthand. We don't enforce a format; instead the prompt asks
+  // Claude to interpret whatever structure is actually on the page/text.
+  const instructions =
+    `This is a business's own sales or inventory ledger — it could be a photo of a handwritten/printed page, ` +
+    `or text already extracted from that page (e.g. via Google Lens) and pasted in. Different businesses lay ` +
+    `this out differently (item then price, qty x item @unit price, shorthand abbreviations, etc.) — read ` +
+    `whatever structure is actually there rather than expecting one fixed format. ` +
+    `Extract every line item you can make out. Respond with ONLY a JSON array, no other text, in this exact shape: ` +
+    `[{"description": "...", "quantity": number, "amount": number_or_null}]. ` +
+    `If a quantity or amount is unreadable or absent, use null. Do not guess values that aren't actually there.`;
+
+  const content = hasImage
+    ? [
+        { type: 'image', source: { type: 'base64', media_type: mediaType || 'image/jpeg', data: imageBase64 } },
+        { type: 'text', text: instructions },
+      ]
+    : [
+        { type: 'text', text: `${instructions}\n\nHere is the pasted ledger text:\n\n${pastedText}` },
+      ];
 
   try {
     const aiRes = await fetch('https://api.anthropic.com/v1/messages', {
@@ -658,19 +751,7 @@ app.post('/ocr/parse-page', requireAuth, async (req, res) => {
       body: JSON.stringify({
         model: 'claude-sonnet-4-6',
         max_tokens: 1500,
-        messages: [{
-          role: 'user',
-          content: [
-            { type: 'image', source: { type: 'base64', media_type: mediaType || 'image/jpeg', data: imageBase64 } },
-            {
-              type: 'text',
-              text: `This is a photo of a handwritten or printed sales/inventory ledger page from an auto-parts shop. ` +
-                `Extract every line item you can read. Respond with ONLY a JSON array, no other text, in this exact shape: ` +
-                `[{"description": "...", "quantity": number, "amount": number_or_null}]. ` +
-                `If a quantity or amount is unreadable or absent, use null. Do not guess values that aren't on the page.`,
-            },
-          ],
-        }],
+        messages: [{ role: 'user', content }],
       }),
     });
 
@@ -687,7 +768,7 @@ app.post('/ocr/parse-page', requireAuth, async (req, res) => {
       rows = JSON.parse(cleaned);
     } catch (e) {
       console.error('[ocr] could not parse Claude output:', text);
-      return res.status(502).json({ error: 'Could not parse extracted data — try a clearer photo' });
+      return res.status(502).json({ error: hasImage ? 'Could not parse extracted data — try a clearer photo' : 'Could not parse the pasted text — check it copied over correctly' });
     }
 
     const inventory = (await pool.query('SELECT * FROM inventory_items WHERE business_id = $1', [req.user.businessId])).rows;
@@ -710,7 +791,7 @@ app.post('/ocr/parse-page', requireAuth, async (req, res) => {
     res.json({ rows: reviewed, totalFromPage, rowCount: reviewed.length });
   } catch (err) {
     console.error('[ocr] error:', err);
-    res.status(500).json({ error: 'Could not process the image' });
+    res.status(500).json({ error: 'Could not process the ledger entry' });
   }
 });
 
