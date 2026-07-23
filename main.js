@@ -447,11 +447,16 @@ app.post('/auth/staff', requireAuth, requireOwner, async (req, res) => {
 });
 
 app.get('/auth/staff', requireAuth, requireOwner, async (req, res) => {
-  const result = await pool.query(
-    'SELECT id, name, phone, role, created_at FROM users WHERE business_id = $1 AND role = $2',
-    [req.user.businessId, 'staff']
-  );
-  res.json({ staff: result.rows });
+  try {
+    const result = await pool.query(
+      'SELECT id, name, phone, role, created_at FROM users WHERE business_id = $1 AND role = $2',
+      [req.user.businessId, 'staff']
+    );
+    res.json({ staff: result.rows });
+  } catch (err) {
+    console.error('[/auth/staff] error:', err.message);
+    res.status(500).json({ error: 'Could not load staff' });
+  }
 });
 
 // GET /me — who's logged in and which business they belong to (frontend uses this right after login)
@@ -481,14 +486,19 @@ app.post('/auth/reset-pin', requireAuth, async (req, res) => {
 });
 
 app.get('/me', requireAuth, async (req, res) => {
-  const business = await pool.query(
-    'SELECT id, name, address, whatsapp_number, created_at, trial_ends_at, next_due_date, monthly_fee, slug FROM businesses WHERE id = $1',
-    [req.user.businessId]
-  );
-  res.json({
-    user: { id: req.user.userId, name: req.user.name, role: req.user.role },
-    business: business.rows[0] || null,
-  });
+  try {
+    const business = await pool.query(
+      'SELECT id, name, address, whatsapp_number, created_at, trial_ends_at, next_due_date, monthly_fee, slug FROM businesses WHERE id = $1',
+      [req.user.businessId]
+    );
+    res.json({
+      user: { id: req.user.userId, name: req.user.name, role: req.user.role },
+      business: business.rows[0] || null,
+    });
+  } catch (err) {
+    console.error('[/me] error:', err.message);
+    res.status(500).json({ error: 'Could not load account info' });
+  }
 });
 
 // --- INVENTORY ---
@@ -617,18 +627,28 @@ app.put('/inventory/:id', requireAuth, requireOwner, async (req, res) => {
   }
   if (updates.length === 0) return res.status(400).json({ error: 'No valid fields to update' });
   values.push(req.params.id, req.user.businessId);
-  const result = await pool.query(
-    `UPDATE inventory_items SET ${updates.join(', ')}, updated_at = now() WHERE id = $${i++} AND business_id = $${i} RETURNING *`,
-    values
-  );
-  if (result.rows.length === 0) return res.status(404).json({ error: 'Item not found' });
-  res.json({ item: result.rows[0] });
+  try {
+    const result = await pool.query(
+      `UPDATE inventory_items SET ${updates.join(', ')}, updated_at = now() WHERE id = $${i++} AND business_id = $${i} RETURNING *`,
+      values
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Item not found' });
+    res.json({ item: result.rows[0] });
+  } catch (err) {
+    console.error('[PUT /inventory/:id] error:', err.message);
+    res.status(500).json({ error: 'Could not update item' });
+  }
 });
 
 app.delete('/inventory/:id', requireAuth, requireOwner, async (req, res) => {
-  const result = await pool.query('DELETE FROM inventory_items WHERE id = $1 AND business_id = $2 RETURNING id', [req.params.id, req.user.businessId]);
-  if (result.rows.length === 0) return res.status(404).json({ error: 'Item not found' });
-  res.json({ deleted: true });
+  try {
+    const result = await pool.query('DELETE FROM inventory_items WHERE id = $1 AND business_id = $2 RETURNING id', [req.params.id, req.user.businessId]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Item not found' });
+    res.json({ deleted: true });
+  } catch (err) {
+    console.error('[DELETE /inventory/:id] error:', err.message);
+    res.status(500).json({ error: 'Could not delete item' });
+  }
 });
 
 // --- SALES ---
