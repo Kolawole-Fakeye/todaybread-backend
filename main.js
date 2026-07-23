@@ -38,6 +38,24 @@ CREATE TABLE IF NOT EXISTS businesses (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Subscription tracking. next_due_date starts equal to trial_ends_at (first
+-- payment is due right when the trial ends), advances by 30 days from the
+-- OLD due date each time an admin marks a business paid. Status itself is
+-- computed at read time (trial / active / overdue) rather than stored, so it
+-- can never drift out of sync with the dates.
+ALTER TABLE businesses ADD COLUMN IF NOT EXISTS trial_ends_at TIMESTAMPTZ;
+ALTER TABLE businesses ADD COLUMN IF NOT EXISTS next_due_date TIMESTAMPTZ;
+ALTER TABLE businesses ADD COLUMN IF NOT EXISTS monthly_fee NUMERIC(12,2) NOT NULL DEFAULT 10000;
+-- Tracks which due date the 7-day-before WhatsApp reminder was already sent
+-- for, so the same cycle doesn't nag the admin more than once.
+ALTER TABLE businesses ADD COLUMN IF NOT EXISTS reminder_sent_for_due_date TIMESTAMPTZ;
+
+-- One-time backfill for businesses that existed before this feature: give them
+-- a clean 30-day due date starting now rather than retroactively marking them
+-- overdue for a feature they never agreed to. New signups always set these
+-- explicitly at signup time, so this only ever touches pre-existing rows.
+UPDATE businesses SET trial_ends_at = now(), next_due_date = now() + interval '30 days' WHERE next_due_date IS NULL;
+
 CREATE TABLE IF NOT EXISTS users (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   business_id UUID NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
@@ -60,10 +78,18 @@ CREATE TABLE IF NOT EXISTS inventory_items (
   stock INTEGER NOT NULL DEFAULT 0,
   reorder_level INTEGER NOT NULL DEFAULT 0,
   origin TEXT,
+  expiry_date DATE,
+  batch_number TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (business_id, sku)
 );
+
+-- Adds the two columns above to a database that already had inventory_items
+-- before this change — CREATE TABLE IF NOT EXISTS above won't add columns
+-- to an existing table, so these run every migrate and are no-ops once applied.
+ALTER TABLE inventory_items ADD COLUMN IF NOT EXISTS expiry_date DATE;
+ALTER TABLE inventory_items ADD COLUMN IF NOT EXISTS batch_number TEXT;
 
 CREATE TABLE IF NOT EXISTS sales (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -220,11 +246,61 @@ function scheduleDailySummaryJob() {
 }
 
 // ----------------------------------------------------------------------------
+// SUBSCRIPTION REMINDERS — a single daily WhatsApp digest to the super admin
+// (not to tenants) listing any business whose payment is due within 7 days
+// or already overdue. Each business only appears once per billing cycle —
+// reminder_sent_for_due_date tracks that, and gets cleared automatically
+// whenever a business is marked paid, so the next cycle reminds again.
+// ----------------------------------------------------------------------------
+async function checkSubscriptionReminders() {
+  const adminNumber = process.env.SUPER_ADMIN_WHATSAPP;
+  if (!adminNumber) {
+    console.warn('[subscription-reminders] SUPER_ADMIN_WHATSAPP not set — skipping');
+    return;
+  }
+  try {
+    const result = await pool.query(`
+      SELECT id, name, next_due_date, monthly_fee
+      FROM businesses
+      WHERE next_due_date IS NOT NULL
+        AND next_due_date <= now() + interval '7 days'
+        AND (reminder_sent_for_due_date IS NULL OR reminder_sent_for_due_date <> next_due_date)
+      ORDER BY next_due_date ASC
+    `);
+    if (result.rows.length === 0) return;
+
+    const lines = result.rows.map((b) => {
+      const overdue = new Date(b.next_due_date) < new Date();
+      const dateStr = new Date(b.next_due_date).toLocaleDateString('en-NG', { day: 'numeric', month: 'short' });
+      return `${overdue ? '🔴' : '🟡'} *${b.name}* — ${naira(b.monthly_fee)} ${overdue ? 'overdue since' : 'due'} ${dateStr}`;
+    });
+    const message = `💳 *TodayBread Subscription Reminders*\n\n${lines.join('\n')}`;
+
+    await sendWhatsAppMessage(adminNumber, message);
+    await pool.query(
+      `UPDATE businesses SET reminder_sent_for_due_date = next_due_date WHERE id = ANY($1)`,
+      [result.rows.map((b) => b.id)]
+    );
+    console.log(`[subscription-reminders] sent digest for ${result.rows.length} business(es)`);
+  } catch (err) {
+    console.error('[subscription-reminders] error:', err.message);
+  }
+}
+
+function scheduleSubscriptionReminderJob() {
+  const timezone = process.env.BUSINESS_TIMEZONE || 'Africa/Lagos';
+  // Runs once a day, separate from the evening sales summary — subscription
+  // reminders are for the admin, not tied to end-of-day business hours.
+  cron.schedule('0 9 * * *', checkSubscriptionReminders, { timezone });
+  console.log(`[subscription-reminders] job scheduled for 09:00 (${timezone})`);
+}
+
+// ----------------------------------------------------------------------------
 // EXPRESS APP
 // ----------------------------------------------------------------------------
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
 app.get('/health', (req, res) => res.json({ ok: true }));
 
@@ -256,7 +332,8 @@ app.post('/auth/signup', async (req, res) => {
     if (existing.rows.length > 0) slug = slug + '-' + Date.now();
 
     const biz = await client.query(
-      'INSERT INTO businesses (name, whatsapp_number, address, slug) VALUES ($1, $2, $3, $4) RETURNING *',
+      `INSERT INTO businesses (name, whatsapp_number, address, slug, trial_ends_at, next_due_date)
+       VALUES ($1, $2, $3, $4, now() + interval '14 days', now() + interval '14 days') RETURNING *`,
       [businessName, whatsappNumber || phone, address || null, slug]
     );
     const pinHash = await bcrypt.hash(pin, 10);
@@ -404,7 +481,10 @@ app.post('/auth/reset-pin', requireAuth, async (req, res) => {
 });
 
 app.get('/me', requireAuth, async (req, res) => {
-  const business = await pool.query('SELECT id, name, address, whatsapp_number, created_at FROM businesses WHERE id = $1', [req.user.businessId]);
+  const business = await pool.query(
+    'SELECT id, name, address, whatsapp_number, created_at, trial_ends_at, next_due_date, monthly_fee, slug FROM businesses WHERE id = $1',
+    [req.user.businessId]
+  );
   res.json({
     user: { id: req.user.userId, name: req.user.name, role: req.user.role },
     business: business.rows[0] || null,
@@ -479,37 +559,59 @@ app.delete('/inventory/categories/:name', requireAuth, requireOwner, async (req,
   }
 });
 
+// SKU is an internal reference the tenant never has to think about — generated
+// here, never typed by the owner. Short enough to write on a physical label
+// if they ever need to, unique enough per business that collisions are rare.
+function generateSku() {
+  return 'ITM-' + Date.now().toString(36).toUpperCase() + '-' + Math.random().toString(36).slice(2, 6).toUpperCase();
+}
+
 app.post('/inventory', requireAuth, requireOwner, async (req, res) => {
-  const { sku, name, size, category, costPrice, salePrice, stock, warehouseStock, reorderLevel, origin, brand } = req.body;
-  if (!sku || !name) return res.status(400).json({ error: 'sku and name are required' });
+  const { name, size, category, costPrice, salePrice, stock, warehouseStock, reorderLevel, origin, brand, expiryDate, batchNumber } = req.body;
+  // Only the item name is truly required — everything else (including price)
+  // can be filled in later. The frontend nudges for a sale price but the
+  // backend won't block on it, since a blank/0 default is safe either way.
+  if (!name || !name.trim()) return res.status(400).json({ error: 'name is required' });
   try {
     // Category is free-form text, owned by the tenant — whatever the owner types
     // when adding an item becomes a real category immediately, no fixed list
     // to update, no approval step. Trim it so "Skincare " and "Skincare" don't
     // silently become two different categories.
     const cleanCategory = category && category.trim() ? category.trim() : null;
-    const result = await pool.query(
-      `INSERT INTO inventory_items (business_id, sku, name, size, category, brand, cost_price, sale_price, stock, warehouse_stock, reorder_level, origin)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
-      [req.user.businessId, sku, name, size, cleanCategory, brand || '', costPrice || 0, salePrice || 0, stock || 0, warehouseStock || 0, reorderLevel || 0, origin]
-    );
+
+    // Auto-generated SKUs collide essentially never (timestamp + random), but
+    // retry once on the off chance of a same-millisecond clash within a business.
+    let result;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const sku = generateSku();
+      try {
+        result = await pool.query(
+          `INSERT INTO inventory_items (business_id, sku, name, size, category, brand, cost_price, sale_price, stock, warehouse_stock, reorder_level, origin, expiry_date, batch_number)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`,
+          [req.user.businessId, sku, name.trim(), size, cleanCategory, brand || '', costPrice || 0, salePrice || 0, stock || 0, warehouseStock || 0, reorderLevel || 0, origin, expiryDate || null, batchNumber || null]
+        );
+        break;
+      } catch (err) {
+        if (err.code === '23505' && attempt === 0) continue; // sku collision — retry once with a new one
+        throw err;
+      }
+    }
     res.status(201).json({ item: result.rows[0] });
   } catch (err) {
-    if (err.code === '23505') return res.status(409).json({ error: 'SKU already exists for this business' });
     console.error(err);
     res.status(500).json({ error: 'Could not create item' });
   }
 });
 
 app.put('/inventory/:id', requireAuth, requireOwner, async (req, res) => {
-  const fields = ['name', 'size', 'category', 'brand', 'cost_price', 'sale_price', 'stock', 'warehouse_stock', 'reorder_level', 'origin'];
-  const map = { costPrice: 'cost_price', salePrice: 'sale_price', reorderLevel: 'reorder_level', warehouseStock: 'warehouse_stock' };
+  const fields = ['name', 'size', 'category', 'brand', 'cost_price', 'sale_price', 'stock', 'warehouse_stock', 'reorder_level', 'origin', 'expiry_date', 'batch_number'];
+  const map = { costPrice: 'cost_price', salePrice: 'sale_price', reorderLevel: 'reorder_level', warehouseStock: 'warehouse_stock', expiryDate: 'expiry_date', batchNumber: 'batch_number' };
   const updates = []; const values = []; let i = 1;
   for (const [key, val] of Object.entries(req.body)) {
     const col = map[key] || key;
     if (fields.includes(col)) {
       // Same trim-and-empty-to-null treatment as create, so edits stay consistent
-      const cleanVal = col === 'category' && typeof val === 'string' ? (val.trim() || null) : val;
+      const cleanVal = (col === 'category' || col === 'expiry_date' || col === 'batch_number') && typeof val === 'string' ? (val.trim() || null) : val;
       updates.push(`${col} = $${i++}`); values.push(cleanVal);
     }
   }
@@ -898,6 +1000,7 @@ app.get('/admin/businesses', requireAuth, requireSuperAdmin, async (req, res) =>
     const result = await pool.query(`
       SELECT
         b.id, b.name, b.address, b.whatsapp_number, b.created_at,
+        b.trial_ends_at, b.next_due_date, b.monthly_fee,
         u.name AS owner_name, u.phone AS owner_phone,
         COUNT(DISTINCT i.id) AS item_count,
         COUNT(DISTINCT s.id) AS sale_count,
@@ -909,13 +1012,35 @@ app.get('/admin/businesses', requireAuth, requireSuperAdmin, async (req, res) =>
       LEFT JOIN inventory_items i ON i.business_id = b.id
       LEFT JOIN sales s ON s.business_id = b.id
       LEFT JOIN users us ON us.business_id = b.id AND us.role = 'staff'
-      GROUP BY b.id, b.name, b.address, b.whatsapp_number, b.created_at, u.name, u.phone
-      ORDER BY b.created_at DESC
+      GROUP BY b.id, b.name, b.address, b.whatsapp_number, b.created_at, b.trial_ends_at, b.next_due_date, b.monthly_fee, u.name, u.phone
+      ORDER BY b.next_due_date ASC NULLS LAST
     `);
     res.json({ businesses: result.rows });
   } catch (err) {
     console.error('[/admin/businesses]', err.message);
     res.status(500).json({ error: 'Could not load businesses' });
+  }
+});
+
+// POST /admin/businesses/:id/mark-paid — advances the business's due date by
+// 30 days from its OLD due date (not from today), keeping them on their
+// original monthly schedule even if payment came in late. Also clears the
+// reminder flag so the next cycle's 7-day-before WhatsApp reminder can fire.
+app.post('/admin/businesses/:id/mark-paid', requireAuth, requireSuperAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE businesses
+       SET next_due_date = COALESCE(next_due_date, now()) + interval '30 days',
+           reminder_sent_for_due_date = NULL
+       WHERE id = $1
+       RETURNING id, next_due_date`,
+      [req.params.id]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: 'Business not found' });
+    res.json({ marked: true, nextDueDate: result.rows[0].next_due_date });
+  } catch (err) {
+    console.error('[/admin/businesses/:id/mark-paid]', err.message);
+    res.status(500).json({ error: 'Could not mark as paid' });
   }
 });
 
@@ -999,4 +1124,5 @@ const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
   console.log(`TodayBread API listening on port ${PORT}`);
   scheduleDailySummaryJob();
+  scheduleSubscriptionReminderJob();
 });
