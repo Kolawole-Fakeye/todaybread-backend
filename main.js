@@ -800,9 +800,9 @@ app.get('/reports/insights', requireAuth, requireOwner, async (req, res) => {
   });
 });
 
-// --- SCAN A PAGE (photo → structured sales data via Claude's vision API) ---
-// Flow: owner/staff photographs a notebook page → we send it to Claude →
-// Claude returns raw {description, quantity, amount} rows → we fuzzy-match
+// --- SCAN A PAGE (photo → structured sales data via Gemini's vision API) ---
+// Flow: owner/staff photographs a notebook page → we send it to Gemini →
+// Gemini returns raw {description, quantity, amount} rows → we fuzzy-match
 // each description against this business's real inventory → return everything
 // for human review. Nothing is recorded until /ocr/commit is called explicitly.
 
@@ -836,14 +836,14 @@ app.post('/ocr/parse-page', requireAuth, async (req, res) => {
   if (hasText && pastedText.length > MAX_PASTE_CHARS) {
     return res.status(400).json({ error: `Pasted text is too long (${pastedText.length} characters, max ${MAX_PASTE_CHARS}) — split it into smaller batches` });
   }
-  if (!process.env.ANTHROPIC_API_KEY) {
-    return res.status(500).json({ error: 'ANTHROPIC_API_KEY is not configured on the server' });
+  if (!process.env.GEMINI_API_KEY) {
+    return res.status(500).json({ error: 'GEMINI_API_KEY is not configured on the server' });
   }
 
   // Every business writes their sales/stock ledger differently — some list
   // "item — qty — price", some do "qty x item @unit price", some just
   // scrawl shorthand. We don't enforce a format; instead the prompt asks
-  // Claude to interpret whatever structure is actually on the page/text.
+  // Gemini to interpret whatever structure is actually on the page/text.
   const instructions =
     `This is a business's own sales or inventory ledger — it could be a photo of a handwritten/printed page, ` +
     `or text already extracted from that page (e.g. via Google Lens) and pasted in. Different businesses lay ` +
@@ -853,43 +853,43 @@ app.post('/ocr/parse-page', requireAuth, async (req, res) => {
     `[{"description": "...", "quantity": number, "amount": number_or_null}]. ` +
     `If a quantity or amount is unreadable or absent, use null. Do not guess values that aren't actually there.`;
 
-  const content = hasImage
+  // Gemini's generateContent takes a flat "parts" array — text and inline
+  // image data side by side, order doesn't matter the way it can for Claude.
+  const parts = hasImage
     ? [
-        { type: 'image', source: { type: 'base64', media_type: mediaType || 'image/jpeg', data: imageBase64 } },
-        { type: 'text', text: instructions },
+        { text: instructions },
+        { inline_data: { mime_type: mediaType || 'image/jpeg', data: imageBase64 } },
       ]
     : [
-        { type: 'text', text: `${instructions}\n\nHere is the pasted ledger text:\n\n${pastedText}` },
+        { text: `${instructions}\n\nHere is the pasted ledger text:\n\n${pastedText}` },
       ];
 
   try {
-    const aiRes = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-6',
-        max_tokens: 1500,
-        messages: [{ role: 'user', content }],
-      }),
-    });
+    const aiRes = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts }],
+          generationConfig: { maxOutputTokens: 1500 },
+        }),
+      }
+    );
 
     const aiData = await aiRes.json();
     if (!aiRes.ok) {
-      console.error('[ocr] Claude API error:', aiData);
+      console.error('[ocr] Gemini API error:', aiData);
       return res.status(502).json({ error: 'Vision extraction failed' });
     }
 
-    const text = aiData.content.map((b) => b.text || '').join('').trim();
+    const text = (aiData.candidates?.[0]?.content?.parts || []).map((p) => p.text || '').join('').trim();
     const cleaned = text.replace(/^```json\s*|\s*```$/g, '');
     let rows;
     try {
       rows = JSON.parse(cleaned);
     } catch (e) {
-      console.error('[ocr] could not parse Claude output:', text);
+      console.error('[ocr] could not parse Gemini output:', text);
       return res.status(502).json({ error: hasImage ? 'Could not parse extracted data — try a clearer photo' : 'Could not parse the pasted text — check it copied over correctly' });
     }
 
