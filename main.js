@@ -25,6 +25,19 @@ const pool = new Pool({
     : { rejectUnauthorized: false },
 });
 
+// Starter categories per industry, seeded into the categories table once at
+// signup. Purely a starting point — owners can rename, delete, or add their
+// own at any time afterward. 'other' gets nothing, since there's no sane
+// generic list that wouldn't just be noise for a business it doesn't fit.
+const INDUSTRY_CATEGORIES = {
+  auto_parts: ['Engine Oil', 'Brake Fluid', 'Coolant', 'Transmission Fluid', 'Power Steering Fluid', 'Grease & Sealant', 'Cleaner & Degreaser', 'Filters', 'Batteries', 'Tyres & Tubes'],
+  cosmetics: ['Skincare', 'Haircare', 'Fragrance', 'Makeup', 'Body Care', 'Soap & Bath', 'Baby Care', "Men's Grooming", 'Nail Care', 'Hair Accessories'],
+  pharmacy: ['Pain Relief', 'Antibiotics', 'Antimalarials', 'Vitamins & Supplements', 'First Aid', 'Cold & Flu', 'Digestive Health', 'Baby & Maternal', 'Medical Devices', 'Skin Treatments'],
+  groceries: ['Beverages', 'Snacks', 'Grains & Cereals', 'Canned Goods', 'Dairy', 'Spices & Seasoning', 'Baking Supplies', 'Household Cleaning', 'Toiletries', 'Frozen Foods'],
+  fashion: ["Men's Wear", "Women's Wear", "Children's Wear", 'Footwear', 'Bags', 'Jewelry & Watches', 'Belts', 'Underwear', 'Fabric & Textiles', 'Accessories'],
+  other: [],
+};
+
 // ----------------------------------------------------------------------------
 // SCHEMA — run once with: node main.js migrate
 // ----------------------------------------------------------------------------
@@ -55,6 +68,24 @@ ALTER TABLE businesses ADD COLUMN IF NOT EXISTS reminder_sent_for_due_date TIMES
 -- overdue for a feature they never agreed to. New signups always set these
 -- explicitly at signup time, so this only ever touches pre-existing rows.
 UPDATE businesses SET trial_ends_at = now(), next_due_date = now() + interval '30 days' WHERE next_due_date IS NULL;
+
+-- Which industry the business picked at signup (auto_parts, cosmetics, pharmacy,
+-- groceries, fashion, other) — used once to pick a starter category set, and
+-- kept around as descriptive metadata after that. Existing businesses predate
+-- this and are left NULL — no retroactive guess, no seeded categories added.
+ALTER TABLE businesses ADD COLUMN IF NOT EXISTS industry TEXT;
+
+-- Categories are tenant-owned and independent of items — this is what makes
+-- pre-seeding possible (a category can exist with zero items using it yet).
+-- Populated once at signup from the industry's starter set, and grows from
+-- there any time an owner types a new category on an item.
+CREATE TABLE IF NOT EXISTS categories (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  business_id UUID NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (business_id, name)
+);
 
 CREATE TABLE IF NOT EXISTS users (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -311,10 +342,12 @@ function generateSlug(name) {
 }
 
 app.post('/auth/signup', async (req, res) => {
-  const { businessName, ownerName, phone, pin, whatsappNumber, address, inviteCode } = req.body;
+  const { businessName, ownerName, phone, pin, whatsappNumber, address, inviteCode, industry } = req.body;
   if (!businessName || !ownerName || !phone || !pin) {
     return res.status(400).json({ error: 'businessName, ownerName, phone, and pin are required' });
   }
+  // Unknown or missing industry just falls back to 'other' (no seeded categories) rather than erroring
+  const cleanIndustry = INDUSTRY_CATEGORIES.hasOwnProperty(industry) ? industry : 'other';
 
   // Invite code gate — only checked if INVITE_CODE env var is set
   const requiredCode = process.env.INVITE_CODE;
@@ -332,15 +365,24 @@ app.post('/auth/signup', async (req, res) => {
     if (existing.rows.length > 0) slug = slug + '-' + Date.now();
 
     const biz = await client.query(
-      `INSERT INTO businesses (name, whatsapp_number, address, slug, trial_ends_at, next_due_date)
-       VALUES ($1, $2, $3, $4, now() + interval '14 days', now() + interval '14 days') RETURNING *`,
-      [businessName, whatsappNumber || phone, address || null, slug]
+      `INSERT INTO businesses (name, whatsapp_number, address, slug, industry, trial_ends_at, next_due_date)
+       VALUES ($1, $2, $3, $4, $5, now() + interval '14 days', now() + interval '14 days') RETURNING *`,
+      [businessName, whatsappNumber || phone, address || null, slug, cleanIndustry]
     );
     const pinHash = await bcrypt.hash(pin, 10);
     const userRes = await client.query(
       `INSERT INTO users (business_id, name, phone, pin_hash, role) VALUES ($1,$2,$3,$4,'owner') RETURNING *`,
       [biz.rows[0].id, ownerName, phone, pinHash]
     );
+
+    const starterCategories = INDUSTRY_CATEGORIES[cleanIndustry] || [];
+    for (const catName of starterCategories) {
+      await client.query(
+        'INSERT INTO categories (business_id, name) VALUES ($1, $2) ON CONFLICT (business_id, name) DO NOTHING',
+        [biz.rows[0].id, catName]
+      );
+    }
+
     await client.query('COMMIT');
     const owner = userRes.rows[0];
 
@@ -488,7 +530,7 @@ app.post('/auth/reset-pin', requireAuth, async (req, res) => {
 app.get('/me', requireAuth, async (req, res) => {
   try {
     const business = await pool.query(
-      'SELECT id, name, address, whatsapp_number, created_at, trial_ends_at, next_due_date, monthly_fee, slug FROM businesses WHERE id = $1',
+      'SELECT id, name, address, whatsapp_number, created_at, trial_ends_at, next_due_date, monthly_fee, slug, industry FROM businesses WHERE id = $1',
       [req.user.businessId]
     );
     res.json({
@@ -520,11 +562,19 @@ app.get('/inventory', requireAuth, async (req, res) => {
 // auto-parts categories). A brand-new tenant with no items yet just gets [].
 app.get('/inventory/categories', requireAuth, async (req, res) => {
   try {
+    // Union of the tenant's category table (includes seeded-but-unused ones)
+    // and whatever's actually in use on items — so a brand-new business sees
+    // its industry starter set immediately, and nothing that's already in use
+    // ever disappears even if it somehow isn't in the categories table.
     const result = await pool.query(
-      `SELECT category, count(*)::int AS item_count
-       FROM inventory_items
-       WHERE business_id = $1 AND category IS NOT NULL AND category <> ''
-       GROUP BY category
+      `SELECT COALESCE(c.name, i.name) AS category, COALESCE(i.item_count, 0) AS item_count
+       FROM (SELECT name FROM categories WHERE business_id = $1) c
+       FULL OUTER JOIN (
+         SELECT category AS name, count(*)::int AS item_count
+         FROM inventory_items
+         WHERE business_id = $1 AND category IS NOT NULL AND category <> ''
+         GROUP BY category
+       ) i ON c.name = i.name
        ORDER BY category ASC`,
       [req.user.businessId]
     );
@@ -540,32 +590,51 @@ app.get('/inventory/categories', requireAuth, async (req, res) => {
 app.patch('/inventory/categories/rename', requireAuth, requireOwner, async (req, res) => {
   const { from, to } = req.body;
   if (!from || !to || !to.trim()) return res.status(400).json({ error: 'from and to are required' });
+  const client = await pool.connect();
   try {
-    const result = await pool.query(
+    await client.query('BEGIN');
+    const result = await client.query(
       `UPDATE inventory_items SET category = $1, updated_at = now()
        WHERE business_id = $2 AND category = $3 RETURNING id`,
       [to.trim(), req.user.businessId, from]
     );
+    await client.query('DELETE FROM categories WHERE business_id = $1 AND name = $2', [req.user.businessId, from]);
+    await client.query(
+      'INSERT INTO categories (business_id, name) VALUES ($1, $2) ON CONFLICT (business_id, name) DO NOTHING',
+      [req.user.businessId, to.trim()]
+    );
+    await client.query('COMMIT');
     res.json({ renamed: true, itemsUpdated: result.rows.length });
   } catch (err) {
+    await client.query('ROLLBACK');
     console.error('[/inventory/categories/rename] error:', err.message);
     res.status(500).json({ error: 'Could not rename category' });
+  } finally {
+    client.release();
   }
 });
 
 // DELETE /inventory/categories/:name — clears that category off every item
-// that has it (items aren't deleted, they just become uncategorized).
+// that has it (items aren't deleted, they just become uncategorized), and
+// removes it from the tenant's category list too.
 app.delete('/inventory/categories/:name', requireAuth, requireOwner, async (req, res) => {
+  const client = await pool.connect();
   try {
-    const result = await pool.query(
+    await client.query('BEGIN');
+    const result = await client.query(
       `UPDATE inventory_items SET category = NULL, updated_at = now()
        WHERE business_id = $1 AND category = $2 RETURNING id`,
       [req.user.businessId, req.params.name]
     );
+    await client.query('DELETE FROM categories WHERE business_id = $1 AND name = $2', [req.user.businessId, req.params.name]);
+    await client.query('COMMIT');
     res.json({ cleared: true, itemsUpdated: result.rows.length });
   } catch (err) {
+    await client.query('ROLLBACK');
     console.error('[/inventory/categories/:name] error:', err.message);
     res.status(500).json({ error: 'Could not clear category' });
+  } finally {
+    client.release();
   }
 });
 
@@ -607,6 +676,12 @@ app.post('/inventory', requireAuth, requireOwner, async (req, res) => {
       }
     }
     res.status(201).json({ item: result.rows[0] });
+    if (cleanCategory) {
+      pool.query(
+        'INSERT INTO categories (business_id, name) VALUES ($1, $2) ON CONFLICT (business_id, name) DO NOTHING',
+        [req.user.businessId, cleanCategory]
+      ).catch((err) => console.error('[categories upsert] error:', err.message));
+    }
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Could not create item' });
@@ -634,6 +709,12 @@ app.put('/inventory/:id', requireAuth, requireOwner, async (req, res) => {
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Item not found' });
     res.json({ item: result.rows[0] });
+    if (result.rows[0].category) {
+      pool.query(
+        'INSERT INTO categories (business_id, name) VALUES ($1, $2) ON CONFLICT (business_id, name) DO NOTHING',
+        [req.user.businessId, result.rows[0].category]
+      ).catch((err) => console.error('[categories upsert] error:', err.message));
+    }
   } catch (err) {
     console.error('[PUT /inventory/:id] error:', err.message);
     res.status(500).json({ error: 'Could not update item' });
@@ -812,9 +893,13 @@ function normalize(str) {
 
 // Simple word-overlap matcher — good enough for short product names typed
 // or handwritten inconsistently (e.g. "brake fluid dot3" vs "DOT 3 Brake Fluid").
+// Always returns the single best candidate if one exists (even a weak one) —
+// the caller decides what to do with a low-confidence result. A floor below
+// 0.12 is filtered out entirely since that's indistinguishable from noise
+// (e.g. matching on one common short word by coincidence).
 function fuzzyMatchItem(description, inventory) {
   const target = normalize(description).split(' ').filter(Boolean);
-  if (target.length === 0) return null;
+  if (target.length === 0 || inventory.length === 0) return null;
   let best = null, bestScore = 0;
   for (const item of inventory) {
     const words = normalize(item.name).split(' ').filter(Boolean);
@@ -822,7 +907,7 @@ function fuzzyMatchItem(description, inventory) {
     const score = overlap / Math.max(target.length, words.length);
     if (score > bestScore) { bestScore = score; best = item; }
   }
-  return bestScore >= 0.3 ? { item: best, confidence: bestScore } : null;
+  return bestScore >= 0.12 ? { item: best, confidence: bestScore } : null;
 }
 
 app.post('/ocr/parse-page', requireAuth, async (req, res) => {
@@ -840,31 +925,51 @@ app.post('/ocr/parse-page', requireAuth, async (req, res) => {
     return res.status(500).json({ error: 'GEMINI_API_KEY is not configured on the server' });
   }
 
-  // Every business writes their sales/stock ledger differently — some list
-  // "item — qty — price", some do "qty x item @unit price", some just
-  // scrawl shorthand. We don't enforce a format; instead the prompt asks
-  // Gemini to interpret whatever structure is actually on the page/text.
-  const instructions =
-    `This is a business's own sales or inventory ledger — it could be a photo of a handwritten/printed page, ` +
-    `or text already extracted from that page (e.g. via Google Lens) and pasted in. Different businesses lay ` +
-    `this out differently (item then price, qty x item @unit price, shorthand abbreviations, etc.) — read ` +
-    `whatever structure is actually there rather than expecting one fixed format. ` +
-    `Extract every line item you can make out. Respond with ONLY a JSON array, no other text, in this exact shape: ` +
-    `[{"description": "...", "quantity": number, "amount": number_or_null}]. ` +
-    `If a quantity or amount is unreadable or absent, use null. Do not guess values that aren't actually there.`;
-
-  // Gemini's generateContent takes a flat "parts" array — text and inline
-  // image data side by side, order doesn't matter the way it can for Claude.
-  const parts = hasImage
-    ? [
-        { text: instructions },
-        { inline_data: { mime_type: mediaType || 'image/jpeg', data: imageBase64 } },
-      ]
-    : [
-        { text: `${instructions}\n\nHere is the pasted ledger text:\n\n${pastedText}` },
-      ];
-
   try {
+    // Grounds the category suggestion in categories this business actually
+    // uses (seeded + custom-added) rather than letting the model invent its
+    // own taxonomy — same union query as GET /inventory/categories.
+    const categoryRows = await pool.query(
+      `SELECT COALESCE(c.name, i.name) AS category
+       FROM (SELECT name FROM categories WHERE business_id = $1) c
+       FULL OUTER JOIN (
+         SELECT category AS name FROM inventory_items
+         WHERE business_id = $1 AND category IS NOT NULL AND category <> ''
+         GROUP BY category
+       ) i ON c.name = i.name
+       ORDER BY category ASC`,
+      [req.user.businessId]
+    );
+    const knownCategories = categoryRows.rows.map((r) => r.category);
+
+    // Every business writes their sales/stock ledger differently — some list
+    // "item — qty — price", some do "qty x item @unit price", some just
+    // scrawl shorthand. We don't enforce a format; instead the prompt asks
+    // Gemini to interpret whatever structure is actually on the page/text.
+    const categoryHint = knownCategories.length > 0
+      ? `This business's known categories are: ${knownCategories.join(', ')}. For each line, suggest the closest fitting category from that list, or null if genuinely none fit. Don't invent a new category name.`
+      : `This business has no categories set up yet — leave "category" null for every line.`;
+    const instructions =
+      `This is a business's own sales or inventory ledger — it could be a photo of a handwritten/printed page, ` +
+      `or text already extracted from that page (e.g. via Google Lens) and pasted in. Different businesses lay ` +
+      `this out differently (item then price, qty x item @unit price, shorthand abbreviations, etc.) — read ` +
+      `whatever structure is actually there rather than expecting one fixed format. ` +
+      `Extract every line item you can make out. ${categoryHint} ` +
+      `Respond with ONLY a JSON array, no other text, in this exact shape: ` +
+      `[{"description": "...", "quantity": number, "amount": number_or_null, "category": string_or_null}]. ` +
+      `If a quantity or amount is unreadable or absent, use null. Do not guess values that aren't actually there.`;
+
+    // Gemini's generateContent takes a flat "parts" array — text and inline
+    // image data side by side, order doesn't matter the way it can for Claude.
+    const parts = hasImage
+      ? [
+          { text: instructions },
+          { inline_data: { mime_type: mediaType || 'image/jpeg', data: imageBase64 } },
+        ]
+      : [
+          { text: `${instructions}\n\nHere is the pasted ledger text:\n\n${pastedText}` },
+        ];
+
     const aiRes = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${process.env.GEMINI_API_KEY}`,
       {
@@ -903,6 +1008,7 @@ app.post('/ocr/parse-page', requireAuth, async (req, res) => {
         rawDescription: row.description,
         quantity: qty,
         amountOnPage: row.amount,
+        suggestedCategory: row.category || null,
         matchedItem: match ? { id: match.item.id, name: match.item.name, confidence: Number(match.confidence.toFixed(2)) } : null,
         suggestedTotal: unitPrice ? unitPrice * qty : row.amount,
         needsReview: !match || match.confidence < 0.6,
