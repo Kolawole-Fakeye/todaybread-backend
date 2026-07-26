@@ -39,6 +39,19 @@ const INDUSTRY_CATEGORIES = {
   other: [],
 };
 
+// Same idea as categories, but for the Brand field — real, recognizable
+// brands for the Nigerian market so a fresh signup feels tailored on day one
+// instead of a blank field. Just a starting menu; fully editable afterward.
+const INDUSTRY_BRANDS = {
+  auto_parts: ['Bosch', 'Castrol', 'Mobil', 'Shell', 'Total', 'Toyota Genuine', 'Honda Genuine', 'Prestone', 'Loctite', 'Permatex'],
+  cosmetics: ['Nivea', 'Vaseline', 'Dove', 'Dettol', 'Cussons', 'Ori', 'Cantu', 'Nice & Lovely', 'Amila', 'St. Ives'],
+  pharmacy: ['Emzor', 'Fidson', 'May & Baker', 'Neimeth', 'GSK', 'Panadol', 'Sanofi', 'Swiss Pharma', 'Juhel', 'Ranbaxy'],
+  electronics: ['Samsung', 'Tecno', 'Infinix', 'Itel', 'Apple', 'Oraimo', 'Anker', 'HP', 'Dell', 'Xiaomi'],
+  groceries: ['Indomie', 'Peak', 'Milo', 'Golden Morn', 'Dangote', 'Golden Penny', 'Nestlé', 'Knorr', 'Maggi', 'Coca-Cola'],
+  fashion: ['Nike', 'Adidas', 'Vlisco', 'Puma', 'Woodin', 'Clarks', 'Skechers', 'Fila', 'Reebok', 'Hollandais'],
+  other: [],
+};
+
 // ----------------------------------------------------------------------------
 // SCHEMA — run once with: node main.js migrate
 // ----------------------------------------------------------------------------
@@ -81,6 +94,16 @@ ALTER TABLE businesses ADD COLUMN IF NOT EXISTS industry TEXT;
 -- Populated once at signup from the industry's starter set, and grows from
 -- there any time an owner types a new category on an item.
 CREATE TABLE IF NOT EXISTS categories (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  business_id UUID NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (business_id, name)
+);
+
+-- Same idea, same shape, for brands — pre-seeded per industry so the Brand
+-- field's autocomplete has real suggestions from day one too.
+CREATE TABLE IF NOT EXISTS brands (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   business_id UUID NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
   name TEXT NOT NULL,
@@ -383,6 +406,13 @@ app.post('/auth/signup', async (req, res) => {
         [biz.rows[0].id, catName]
       );
     }
+    const starterBrands = INDUSTRY_BRANDS[cleanIndustry] || [];
+    for (const brandName of starterBrands) {
+      await client.query(
+        'INSERT INTO brands (business_id, name) VALUES ($1, $2) ON CONFLICT (business_id, name) DO NOTHING',
+        [biz.rows[0].id, brandName]
+      );
+    }
 
     await client.query('COMMIT');
     const owner = userRes.rows[0];
@@ -586,6 +616,28 @@ app.get('/inventory/categories', requireAuth, async (req, res) => {
   }
 });
 
+// Same union pattern as categories, for the Brand field's autocomplete.
+app.get('/inventory/brands', requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT COALESCE(b.name, i.name) AS brand, COALESCE(i.item_count, 0) AS item_count
+       FROM (SELECT name FROM brands WHERE business_id = $1) b
+       FULL OUTER JOIN (
+         SELECT brand AS name, count(*)::int AS item_count
+         FROM inventory_items
+         WHERE business_id = $1 AND brand IS NOT NULL AND brand <> ''
+         GROUP BY brand
+       ) i ON b.name = i.name
+       ORDER BY brand ASC`,
+      [req.user.businessId]
+    );
+    res.json({ brands: result.rows });
+  } catch (err) {
+    console.error('[/inventory/brands] error:', err.message);
+    res.status(500).json({ error: 'Could not load brands' });
+  }
+});
+
 // PATCH /inventory/categories/rename — owner renames a category across every
 // item that currently uses it in one shot (e.g. "Brake Fluid" -> "Fluids").
 app.patch('/inventory/categories/rename', requireAuth, requireOwner, async (req, res) => {
@@ -639,6 +691,55 @@ app.delete('/inventory/categories/:name', requireAuth, requireOwner, async (req,
   }
 });
 
+// Same rename/delete pattern as categories, for brands.
+app.patch('/inventory/brands/rename', requireAuth, requireOwner, async (req, res) => {
+  const { from, to } = req.body;
+  if (!from || !to || !to.trim()) return res.status(400).json({ error: 'from and to are required' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await client.query(
+      `UPDATE inventory_items SET brand = $1, updated_at = now()
+       WHERE business_id = $2 AND brand = $3 RETURNING id`,
+      [to.trim(), req.user.businessId, from]
+    );
+    await client.query('DELETE FROM brands WHERE business_id = $1 AND name = $2', [req.user.businessId, from]);
+    await client.query(
+      'INSERT INTO brands (business_id, name) VALUES ($1, $2) ON CONFLICT (business_id, name) DO NOTHING',
+      [req.user.businessId, to.trim()]
+    );
+    await client.query('COMMIT');
+    res.json({ renamed: true, itemsUpdated: result.rows.length });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('[/inventory/brands/rename] error:', err.message);
+    res.status(500).json({ error: 'Could not rename brand' });
+  } finally {
+    client.release();
+  }
+});
+
+app.delete('/inventory/brands/:name', requireAuth, requireOwner, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await client.query(
+      `UPDATE inventory_items SET brand = '', updated_at = now()
+       WHERE business_id = $1 AND brand = $2 RETURNING id`,
+      [req.user.businessId, req.params.name]
+    );
+    await client.query('DELETE FROM brands WHERE business_id = $1 AND name = $2', [req.user.businessId, req.params.name]);
+    await client.query('COMMIT');
+    res.json({ cleared: true, itemsUpdated: result.rows.length });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('[/inventory/brands/:name] error:', err.message);
+    res.status(500).json({ error: 'Could not clear brand' });
+  } finally {
+    client.release();
+  }
+});
+
 // SKU is an internal reference the tenant never has to think about — generated
 // here, never typed by the owner. Short enough to write on a physical label
 // if they ever need to, unique enough per business that collisions are rare.
@@ -683,6 +784,12 @@ app.post('/inventory', requireAuth, requireOwner, async (req, res) => {
         [req.user.businessId, cleanCategory]
       ).catch((err) => console.error('[categories upsert] error:', err.message));
     }
+    if (brand && brand.trim()) {
+      pool.query(
+        'INSERT INTO brands (business_id, name) VALUES ($1, $2) ON CONFLICT (business_id, name) DO NOTHING',
+        [req.user.businessId, brand.trim()]
+      ).catch((err) => console.error('[brands upsert] error:', err.message));
+    }
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Could not create item' });
@@ -715,6 +822,12 @@ app.put('/inventory/:id', requireAuth, requireOwner, async (req, res) => {
         'INSERT INTO categories (business_id, name) VALUES ($1, $2) ON CONFLICT (business_id, name) DO NOTHING',
         [req.user.businessId, result.rows[0].category]
       ).catch((err) => console.error('[categories upsert] error:', err.message));
+    }
+    if (result.rows[0].brand) {
+      pool.query(
+        'INSERT INTO brands (business_id, name) VALUES ($1, $2) ON CONFLICT (business_id, name) DO NOTHING',
+        [req.user.businessId, result.rows[0].brand]
+      ).catch((err) => console.error('[brands upsert] error:', err.message));
     }
   } catch (err) {
     console.error('[PUT /inventory/:id] error:', err.message);
@@ -954,11 +1067,15 @@ app.post('/ocr/parse-page', requireAuth, async (req, res) => {
       `This is a business's own sales or inventory ledger — it could be a photo of a handwritten/printed page, ` +
       `or text already extracted from that page (e.g. via Google Lens) and pasted in. Different businesses lay ` +
       `this out differently (item then price, qty x item @unit price, shorthand abbreviations, etc.) — read ` +
-      `whatever structure is actually there rather than expecting one fixed format. ` +
+      `whatever structure is actually there rather than expecting one fixed format. Lens-extracted text especially ` +
+      `can be messy — numbers fused to words, stray brackets or symbols from table borders, misaligned columns. ` +
+      `Do your best to pull real item lines out of that noise. ` +
       `Extract every line item you can make out. ${categoryHint} ` +
-      `Respond with ONLY a JSON array, no other text, in this exact shape: ` +
+      `Respond with ONLY a JSON array — no explanation, no markdown code fences, no commentary before or after it, ` +
+      `even if the input looks unusual or you're unsure. In this exact shape: ` +
       `[{"description": "...", "quantity": number, "amount": number_or_null, "category": string_or_null}]. ` +
-      `If a quantity or amount is unreadable or absent, use null. Do not guess values that aren't actually there.`;
+      `If a quantity or amount is unreadable or absent, use null. Do not guess values that aren't actually there. ` +
+      `If truly nothing on the page looks like an item line, respond with an empty array [].`;
 
     // Gemini's generateContent takes a flat "parts" array — text and inline
     // image data side by side, order doesn't matter the way it can for Claude.
@@ -990,10 +1107,19 @@ app.post('/ocr/parse-page', requireAuth, async (req, res) => {
     }
 
     const text = (aiData.candidates?.[0]?.content?.parts || []).map((p) => p.text || '').join('').trim();
-    const cleaned = text.replace(/^```json\s*|\s*```$/g, '');
+    // Don't assume the whole response is pure JSON — strip fences if present,
+    // then pull out the first [...] block from wherever it actually sits in
+    // the response. Survives the model adding a stray sentence of commentary
+    // before or after the array, which happens more often on messy/ambiguous
+    // input than on a clean, obvious ledger.
+    const fenceStripped = text.replace(/```json\s*|```/g, '');
+    const arrayMatch = fenceStripped.match(/\[[\s\S]*\]/);
+    const cleaned = arrayMatch ? arrayMatch[0] : fenceStripped;
     let rows;
     try {
-      rows = JSON.parse(cleaned);
+      const parsed = JSON.parse(cleaned);
+      rows = Array.isArray(parsed) ? parsed : (parsed.items || parsed.rows || parsed.lines || []);
+      if (!Array.isArray(rows)) throw new Error('not an array');
     } catch (e) {
       console.error('[ocr] could not parse Gemini output:', text);
       return res.status(502).json({ error: hasImage ? 'Could not parse extracted data — try a clearer photo' : 'Could not parse the pasted text — check it copied over correctly' });
