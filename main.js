@@ -33,6 +33,7 @@ const INDUSTRY_CATEGORIES = {
   auto_parts: ['Engine Oil', 'Brake Fluid', 'Coolant', 'Transmission Fluid', 'Power Steering Fluid', 'Grease & Sealant', 'Cleaner & Degreaser', 'Filters', 'Batteries', 'Tyres & Tubes'],
   cosmetics: ['Skincare', 'Haircare', 'Fragrance', 'Makeup', 'Body Care', 'Soap & Bath', 'Baby Care', "Men's Grooming", 'Nail Care', 'Hair Accessories'],
   pharmacy: ['Pain Relief', 'Antibiotics', 'Antimalarials', 'Vitamins & Supplements', 'First Aid', 'Cold & Flu', 'Digestive Health', 'Baby & Maternal', 'Medical Devices', 'Skin Treatments'],
+  electronics: ['Phones', 'Chargers & Cables', 'Phone Cases & Screen Protectors', 'Laptops & Accessories', 'Earphones & Headphones', 'Power Banks', 'Memory Cards & Flash Drives', 'Smart Watches', 'Computer Accessories', 'Networking & Routers'],
   groceries: ['Beverages', 'Snacks', 'Grains & Cereals', 'Canned Goods', 'Dairy', 'Spices & Seasoning', 'Baking Supplies', 'Household Cleaning', 'Toiletries', 'Frozen Foods'],
   fashion: ["Men's Wear", "Women's Wear", "Children's Wear", 'Footwear', 'Bags', 'Jewelry & Watches', 'Belts', 'Underwear', 'Fabric & Textiles', 'Accessories'],
   other: [],
