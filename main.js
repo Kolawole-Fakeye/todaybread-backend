@@ -1025,7 +1025,7 @@ function fuzzyMatchItem(description, inventory) {
 }
 
 app.post('/ocr/parse-page', requireAuth, async (req, res) => {
-  const { imageBase64, mediaType, text: pastedText } = req.body;
+  const { imageBase64, mediaType, text: pastedText, mode } = req.body;
   const hasImage = !!imageBase64;
   const hasText = !!(pastedText && pastedText.trim());
   if (!hasImage && !hasText) {
@@ -1063,13 +1063,25 @@ app.post('/ocr/parse-page', requireAuth, async (req, res) => {
     const categoryHint = knownCategories.length > 0
       ? `This business's known categories are: ${knownCategories.join(', ')}. For each line, suggest the closest fitting category from that list, or null if genuinely none fit. Don't invent a new category name.`
       : `This business has no categories set up yet — leave "category" null for every line.`;
+    // Some ledgers (especially pharmacy-style stock registers) have SEPARATE
+    // columns for stock received, stock issued/sold, and running balance —
+    // all for the same item, on the same row. Without knowing which one the
+    // person actually wants, "quantity" is ambiguous. The current Notebook
+    // mode disambiguates this.
+    const quantityHint = mode === 'stock'
+      ? `The person is in "Stock Arrival" mode — they're recording new stock coming IN. If a row has separate columns like "Qty Received"/"Stock In" vs "Qty Issued"/"Stock Out" vs "Balance", use the RECEIVED/STOCK-IN number as "quantity" and ignore the issued and balance numbers. If there's only one quantity on the line, use that.`
+      : `The person is in "Recording Sales" mode — they're logging what was SOLD. If a row has separate columns like "Qty Issued"/"Stock Out"/"Sold" vs "Qty Received" vs "Balance", use the ISSUED/SOLD/STOCK-OUT number as "quantity" and ignore the received and balance numbers. A dash or blank in the issued column means nothing was sold on that row — skip that line entirely rather than inventing a number. If there's only one quantity on the line, use that.`;
     const instructions =
       `This is a business's own sales or inventory ledger — it could be a photo of a handwritten/printed page, ` +
       `or text already extracted from that page (e.g. via Google Lens) and pasted in. Different businesses lay ` +
       `this out differently (item then price, qty x item @unit price, shorthand abbreviations, etc.) — read ` +
       `whatever structure is actually there rather than expecting one fixed format. Lens-extracted text especially ` +
-      `can be messy — numbers fused to words, stray brackets or symbols from table borders, misaligned columns. ` +
-      `Do your best to pull real item lines out of that noise. ` +
+      `can be messy — numbers fused to words, stray brackets or symbols from table borders, misaligned columns, ` +
+      `and entire rows run together with no clear line breaks between them (e.g. a date, item name, batch code, ` +
+      `expiry date, and multiple quantity columns all concatenated in sequence). Use context clues — units like ` +
+      `cartons/packs/bottles, batch-code patterns, date-like tokens, keywords like "Delivered"/"Sold"/"Restocked" — ` +
+      `to figure out where one row ends and the next begins. Do your best to pull real item lines out of that noise. ` +
+      `${quantityHint} ` +
       `Extract every line item you can make out. ${categoryHint} ` +
       `Respond with ONLY a JSON array — no explanation, no markdown code fences, no commentary before or after it, ` +
       `even if the input looks unusual or you're unsure. In this exact shape: ` +
@@ -1095,7 +1107,23 @@ app.post('/ocr/parse-page', requireAuth, async (req, res) => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           contents: [{ role: 'user', parts }],
-          generationConfig: { maxOutputTokens: 1500 },
+          generationConfig: {
+            maxOutputTokens: 1500,
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: 'ARRAY',
+              items: {
+                type: 'OBJECT',
+                properties: {
+                  description: { type: 'STRING' },
+                  quantity: { type: 'NUMBER', nullable: true },
+                  amount: { type: 'NUMBER', nullable: true },
+                  category: { type: 'STRING', nullable: true },
+                },
+                required: ['description'],
+              },
+            },
+          },
         }),
       }
     );
@@ -1103,7 +1131,7 @@ app.post('/ocr/parse-page', requireAuth, async (req, res) => {
     const aiData = await aiRes.json();
     if (!aiRes.ok) {
       console.error('[ocr] Gemini API error:', aiData);
-      return res.status(502).json({ error: 'Vision extraction failed' });
+      return res.status(502).json({ error: 'Vision extraction failed', debug: aiData?.error?.message || JSON.stringify(aiData).slice(0, 500) });
     }
 
     const text = (aiData.candidates?.[0]?.content?.parts || []).map((p) => p.text || '').join('').trim();
@@ -1122,7 +1150,12 @@ app.post('/ocr/parse-page', requireAuth, async (req, res) => {
       if (!Array.isArray(rows)) throw new Error('not an array');
     } catch (e) {
       console.error('[ocr] could not parse Gemini output:', text);
-      return res.status(502).json({ error: hasImage ? 'Could not parse extracted data — try a clearer photo' : 'Could not parse the pasted text — check it copied over correctly' });
+      return res.status(502).json({
+        error: hasImage ? 'Could not parse extracted data — try a clearer photo' : 'Could not parse the pasted text — check it copied over correctly',
+        // Raw model output, truncated — lets you see exactly what it said
+        // instead of having to go dig through Render's server logs.
+        debug: text.slice(0, 800),
+      });
     }
 
     const inventory = (await pool.query('SELECT * FROM inventory_items WHERE business_id = $1', [req.user.businessId])).rows;
@@ -1146,7 +1179,7 @@ app.post('/ocr/parse-page', requireAuth, async (req, res) => {
     res.json({ rows: reviewed, totalFromPage, rowCount: reviewed.length });
   } catch (err) {
     console.error('[ocr] error:', err);
-    res.status(500).json({ error: 'Could not process the ledger entry' });
+    res.status(500).json({ error: 'Could not process the ledger entry', debug: err.message });
   }
 });
 
