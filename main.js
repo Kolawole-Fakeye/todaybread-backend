@@ -161,9 +161,30 @@ CREATE TABLE IF NOT EXISTS sales (
   UNIQUE (business_id, client_uuid)
 );
 
+-- A voided sale isn't deleted — it stays in the log (so the record of what
+-- happened is never lost) but is excluded from revenue/profit everywhere,
+-- and its stock is restored when voided.
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS voided_at TIMESTAMPTZ;
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS voided_by UUID REFERENCES users(id);
+
+-- Lightweight audit trail for the mutations an owner would actually want to
+-- ask "who did this" about — price/cost changes, deletions, voided sales,
+-- taxonomy cleanup. Not exhaustive (not every field edit on every entity),
+-- deliberately scoped to what matters for accountability.
+CREATE TABLE IF NOT EXISTS audit_log (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  business_id UUID NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+  user_id UUID REFERENCES users(id),
+  user_name TEXT,
+  action TEXT NOT NULL,
+  details TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE INDEX IF NOT EXISTS idx_sales_business_time ON sales (business_id, occurred_at);
 CREATE INDEX IF NOT EXISTS idx_inventory_business ON inventory_items (business_id);
 CREATE INDEX IF NOT EXISTS idx_users_business ON users (business_id);
+CREATE INDEX IF NOT EXISTS idx_audit_business_time ON audit_log (business_id, created_at);
 `;
 
 async function migrate() {
@@ -203,6 +224,16 @@ function requireAuth(req, res, next) {
 function requireOwner(req, res, next) {
   if (req.user?.role !== 'owner') return res.status(403).json({ error: 'Owner access required' });
   next();
+}
+
+// Fire-and-forget by design — an audit log failure should never break the
+// actual action being logged (e.g. a sale voiding successfully shouldn't
+// fail just because the log insert had a hiccup).
+function logAudit(businessId, user, action, details) {
+  pool.query(
+    'INSERT INTO audit_log (business_id, user_id, user_name, action, details) VALUES ($1, $2, $3, $4, $5)',
+    [businessId, user?.userId || null, user?.name || null, action, details || null]
+  ).catch((err) => console.error('[audit] log failed:', err.message));
 }
 
 // ----------------------------------------------------------------------------
@@ -486,15 +517,38 @@ app.patch('/inventory/:id/visibility', requireAuth, requireOwner, async (req, re
 });
 
 
+// In-memory login attempt tracker, keyed by phone number. Resets on server
+// restart, which is fine — the goal is stopping a sustained PIN-guessing
+// script, not building a persistent security log. 5 failed attempts within
+// 15 minutes locks that phone number out for 15 minutes.
+const loginAttempts = new Map();
+const LOGIN_MAX_ATTEMPTS = 5;
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_LOCKOUT_MS = 15 * 60 * 1000;
+
 app.post('/auth/login', async (req, res) => {
   const { phone, pin } = req.body;
   if (!phone || !pin) return res.status(400).json({ error: 'phone and pin are required' });
+  const key = phone.trim();
+  const now = Date.now();
+  const existing = loginAttempts.get(key);
+  if (existing?.lockedUntil && existing.lockedUntil > now) {
+    const waitMin = Math.ceil((existing.lockedUntil - now) / 60000);
+    return res.status(429).json({ error: `Too many failed attempts. Try again in ${waitMin} minute${waitMin === 1 ? '' : 's'}.` });
+  }
   try {
     const result = await pool.query('SELECT * FROM users WHERE phone = $1', [phone]);
     const user = result.rows[0];
     if (!user || !(await bcrypt.compare(pin, user.pin_hash))) {
+      const stillInWindow = existing && now - existing.firstAttemptAt < LOGIN_WINDOW_MS;
+      const count = (stillInWindow ? existing.count : 0) + 1;
+      const firstAttemptAt = stillInWindow ? existing.firstAttemptAt : now;
+      const lockedUntil = count >= LOGIN_MAX_ATTEMPTS ? now + LOGIN_LOCKOUT_MS : null;
+      loginAttempts.set(key, { count, firstAttemptAt, lockedUntil });
+      if (lockedUntil) return res.status(429).json({ error: 'Too many failed attempts. Try again in 15 minutes.' });
       return res.status(401).json({ error: 'Invalid phone or PIN' });
     }
+    loginAttempts.delete(key);
     res.json({ token: signToken(user), user: { id: user.id, name: user.name, role: user.role, businessId: user.business_id } });
   } catch (err) {
     console.error(err);
@@ -682,6 +736,7 @@ app.delete('/inventory/categories/:name', requireAuth, requireOwner, async (req,
     await client.query('DELETE FROM categories WHERE business_id = $1 AND name = $2', [req.user.businessId, req.params.name]);
     await client.query('COMMIT');
     res.json({ cleared: true, itemsUpdated: result.rows.length });
+    logAudit(req.user.businessId, req.user, 'category_deleted', `Deleted category "${req.params.name}" (${result.rows.length} item${result.rows.length === 1 ? '' : 's'} affected)`);
   } catch (err) {
     await client.query('ROLLBACK');
     console.error('[/inventory/categories/:name] error:', err.message);
@@ -731,6 +786,7 @@ app.delete('/inventory/brands/:name', requireAuth, requireOwner, async (req, res
     await client.query('DELETE FROM brands WHERE business_id = $1 AND name = $2', [req.user.businessId, req.params.name]);
     await client.query('COMMIT');
     res.json({ cleared: true, itemsUpdated: result.rows.length });
+    logAudit(req.user.businessId, req.user, 'brand_deleted', `Deleted brand "${req.params.name}" (${result.rows.length} item${result.rows.length === 1 ? '' : 's'} affected)`);
   } catch (err) {
     await client.query('ROLLBACK');
     console.error('[/inventory/brands/:name] error:', err.message);
@@ -809,8 +865,14 @@ app.put('/inventory/:id', requireAuth, requireOwner, async (req, res) => {
     }
   }
   if (updates.length === 0) return res.status(400).json({ error: 'No valid fields to update' });
+  const pricingChanged = updates.some((u) => u.startsWith('cost_price') || u.startsWith('sale_price'));
   values.push(req.params.id, req.user.businessId);
   try {
+    // Grab the before-state only when it's actually needed for the audit
+    // note — no point on every ordinary stock-count edit.
+    const before = pricingChanged
+      ? (await pool.query('SELECT name, cost_price, sale_price FROM inventory_items WHERE id = $1 AND business_id = $2', [req.params.id, req.user.businessId])).rows[0]
+      : null;
     const result = await pool.query(
       `UPDATE inventory_items SET ${updates.join(', ')}, updated_at = now() WHERE id = $${i++} AND business_id = $${i} RETURNING *`,
       values
@@ -829,6 +891,12 @@ app.put('/inventory/:id', requireAuth, requireOwner, async (req, res) => {
         [req.user.businessId, result.rows[0].brand]
       ).catch((err) => console.error('[brands upsert] error:', err.message));
     }
+    if (before && (Number(before.cost_price) !== Number(result.rows[0].cost_price) || Number(before.sale_price) !== Number(result.rows[0].sale_price))) {
+      const parts = [];
+      if (Number(before.cost_price) !== Number(result.rows[0].cost_price)) parts.push(`cost ₦${before.cost_price} → ₦${result.rows[0].cost_price}`);
+      if (Number(before.sale_price) !== Number(result.rows[0].sale_price)) parts.push(`price ₦${before.sale_price} → ₦${result.rows[0].sale_price}`);
+      logAudit(req.user.businessId, req.user, 'item_price_changed', `"${before.name}": ${parts.join(', ')}`);
+    }
   } catch (err) {
     console.error('[PUT /inventory/:id] error:', err.message);
     res.status(500).json({ error: 'Could not update item' });
@@ -837,12 +905,86 @@ app.put('/inventory/:id', requireAuth, requireOwner, async (req, res) => {
 
 app.delete('/inventory/:id', requireAuth, requireOwner, async (req, res) => {
   try {
-    const result = await pool.query('DELETE FROM inventory_items WHERE id = $1 AND business_id = $2 RETURNING id', [req.params.id, req.user.businessId]);
+    const result = await pool.query('DELETE FROM inventory_items WHERE id = $1 AND business_id = $2 RETURNING id, name', [req.params.id, req.user.businessId]);
     if (result.rows.length === 0) return res.status(404).json({ error: 'Item not found' });
     res.json({ deleted: true });
+    logAudit(req.user.businessId, req.user, 'item_deleted', `Deleted "${result.rows[0].name}"`);
   } catch (err) {
     console.error('[DELETE /inventory/:id] error:', err.message);
     res.status(500).json({ error: 'Could not delete item' });
+  }
+});
+
+// PATCH /inventory/:id/restock — moves units from warehouse stock to shop
+// floor stock. Internal transfer only, no cost implications (same items,
+// same cost) — this is just relocating what's already owned, not receiving
+// a new delivery. See /receive-stock below for that case.
+app.patch('/inventory/:id/restock', requireAuth, requireOwner, async (req, res) => {
+  const qty = Number(req.body.qty);
+  if (!qty || qty <= 0) return res.status(400).json({ error: 'qty must be a positive number' });
+  try {
+    const result = await pool.query(
+      `UPDATE inventory_items
+       SET stock = stock + $1, warehouse_stock = warehouse_stock - $1, updated_at = now()
+       WHERE id = $2 AND business_id = $3 AND warehouse_stock >= $1
+       RETURNING stock, warehouse_stock`,
+      [qty, req.params.id, req.user.businessId]
+    );
+    if (result.rows.length === 0) return res.status(409).json({ error: 'Not enough warehouse stock to move that much' });
+    res.json({ stock: result.rows[0].stock, warehouseStock: result.rows[0].warehouse_stock });
+  } catch (err) {
+    console.error('[PATCH /inventory/:id/restock] error:', err.message);
+    res.status(500).json({ error: 'Could not restock' });
+  }
+});
+
+// PATCH /inventory/:id/receive-stock — a real delivery arriving, as opposed
+// to /restock above (which just moves stock already owned between warehouse
+// and shop floor). If a unit cost is given and it differs from the current
+// cost_price, the new cost is calculated as a WEIGHTED AVERAGE across old and
+// new stock — e.g. 10 units @ ₦100 + 5 units @ ₦130 becomes cost ₦110.
+// If no cost is given, existing cost is left untouched (same as before).
+// Expiry/batch are filled only if the item doesn't already have one — a
+// second delivery's dates never silently overwrite the first's, since this
+// model tracks one expiry per item, not per batch.
+app.patch('/inventory/:id/receive-stock', requireAuth, requireOwner, async (req, res) => {
+  const qty = Number(req.body.qty);
+  const unitCost = req.body.unitCost != null ? Number(req.body.unitCost) : null;
+  const expiryDate = req.body.expiryDate || null;
+  const batchNumber = req.body.batchNumber || null;
+  if (!qty || qty <= 0) return res.status(400).json({ error: 'qty must be a positive number' });
+  try {
+    const existing = await pool.query(
+      'SELECT name, stock, cost_price, expiry_date, batch_number FROM inventory_items WHERE id = $1 AND business_id = $2',
+      [req.params.id, req.user.businessId]
+    );
+    if (!existing.rows[0]) return res.status(404).json({ error: 'Item not found' });
+    const item = existing.rows[0];
+
+    let newCost = Number(item.cost_price);
+    const costChanging = unitCost != null && unitCost > 0 && unitCost !== Number(item.cost_price);
+    if (costChanging) {
+      const oldStock = Number(item.stock);
+      newCost = oldStock > 0
+        ? Math.round(((oldStock * Number(item.cost_price)) + (qty * unitCost)) / (oldStock + qty) * 100) / 100
+        : unitCost;
+    }
+    const newExpiry = item.expiry_date ? item.expiry_date : expiryDate;
+    const newBatch = item.batch_number ? item.batch_number : batchNumber;
+
+    const result = await pool.query(
+      `UPDATE inventory_items
+       SET stock = stock + $1, cost_price = $2, expiry_date = $3, batch_number = $4, updated_at = now()
+       WHERE id = $5 AND business_id = $6 RETURNING *`,
+      [qty, newCost, newExpiry, newBatch, req.params.id, req.user.businessId]
+    );
+    res.json({ item: result.rows[0] });
+    if (costChanging) {
+      logAudit(req.user.businessId, req.user, 'item_price_changed', `"${item.name}": cost ₦${item.cost_price} → ₦${newCost} (weighted average, received ${qty} @ ₦${unitCost})`);
+    }
+  } catch (err) {
+    console.error('[PATCH /inventory/:id/receive-stock] error:', err.message);
+    res.status(500).json({ error: 'Could not receive stock' });
   }
 });
 
@@ -931,6 +1073,60 @@ app.get('/sales', requireAuth, async (req, res) => {
   }
 });
 
+// POST /sales/:id/void — reverses a mistaken sale. The sale record itself
+// is NEVER deleted (that would erase the fact it happened at all) — it's
+// marked voided instead, and stays visible in the sales log crossed out.
+// Stock is restored by the sold quantity. Owner only, since this touches
+// both money and inventory counts.
+app.post('/sales/:id/void', requireAuth, requireOwner, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const saleResult = await client.query(
+      `SELECT s.*, i.name AS item_name FROM sales s JOIN inventory_items i ON i.id = s.item_id
+       WHERE s.id = $1 AND s.business_id = $2 FOR UPDATE`,
+      [req.params.id, req.user.businessId]
+    );
+    const sale = saleResult.rows[0];
+    if (!sale) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Sale not found' }); }
+    if (sale.voided_at) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'This sale is already voided' }); }
+
+    const itemResult = await client.query(
+      'UPDATE inventory_items SET stock = stock + $1, updated_at = now() WHERE id = $2 RETURNING stock',
+      [sale.qty, sale.item_id]
+    );
+    await client.query(
+      'UPDATE sales SET voided_at = now(), voided_by = $1 WHERE id = $2',
+      [req.user.userId, req.params.id]
+    );
+    await client.query('COMMIT');
+    res.json({ voided: true, restoredStock: itemResult.rows[0].stock });
+    logAudit(req.user.businessId, req.user, 'sale_voided', `Voided sale of ${sale.qty} × "${sale.item_name}" (₦${sale.qty * sale.unit_price})`);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('[/sales/:id/void] error:', err.message);
+    res.status(500).json({ error: 'Could not void sale' });
+  } finally {
+    client.release();
+  }
+});
+
+// GET /audit-log — recent accountability events for this business (price/cost
+// changes, deletions, voided sales, taxonomy cleanup). Owner only.
+app.get('/audit-log', requireAuth, requireOwner, async (req, res) => {
+  try {
+    const limit = Math.min(Number(req.query.limit) || 30, 100);
+    const result = await pool.query(
+      'SELECT id, user_name, action, details, created_at FROM audit_log WHERE business_id = $1 ORDER BY created_at DESC LIMIT $2',
+      [req.user.businessId, limit]
+    );
+    res.json({ entries: result.rows });
+  } catch (err) {
+    console.error('[/audit-log] error:', err.message);
+    res.status(500).json({ error: 'Could not load activity log' });
+  }
+});
+
 // --- REPORTS / INSIGHTS ---
 function rangeToSince(range) {
   const now = new Date();
@@ -941,58 +1137,68 @@ function rangeToSince(range) {
 }
 
 app.get('/reports/summary', requireAuth, requireOwner, async (req, res) => {
-  const since = rangeToSince(req.query.range || 'today');
-  const conditions = ['business_id = $1']; const values = [req.user.businessId];
-  if (since) { conditions.push('occurred_at >= $2'); values.push(since); }
-  const result = await pool.query(`SELECT qty, unit_price, unit_cost, payment_method FROM sales WHERE ${conditions.join(' AND ')}`, values);
+  try {
+    const since = rangeToSince(req.query.range || 'today');
+    const conditions = ['business_id = $1', 'voided_at IS NULL']; const values = [req.user.businessId];
+    if (since) { conditions.push('occurred_at >= $2'); values.push(since); }
+    const result = await pool.query(`SELECT qty, unit_price, unit_cost, payment_method FROM sales WHERE ${conditions.join(' AND ')}`, values);
 
-  let revenue = 0, cost = 0; const byPayment = {};
-  for (const row of result.rows) {
-    const rev = row.qty * row.unit_price;
-    revenue += rev; cost += row.qty * row.unit_cost;
-    byPayment[row.payment_method] = (byPayment[row.payment_method] || 0) + rev;
+    let revenue = 0, cost = 0; const byPayment = {};
+    for (const row of result.rows) {
+      const rev = row.qty * row.unit_price;
+      revenue += rev; cost += row.qty * row.unit_cost;
+      byPayment[row.payment_method] = (byPayment[row.payment_method] || 0) + rev;
+    }
+    const profit = revenue - cost;
+    res.json({ revenue, cost, profit, margin: revenue > 0 ? (profit / revenue) * 100 : 0, byPayment, transactionCount: result.rows.length });
+  } catch (err) {
+    console.error('[/reports/summary] error:', err.message);
+    res.status(500).json({ error: 'Could not load summary' });
   }
-  const profit = revenue - cost;
-  res.json({ revenue, cost, profit, margin: revenue > 0 ? (profit / revenue) * 100 : 0, byPayment, transactionCount: result.rows.length });
 });
 
 app.get('/reports/insights', requireAuth, requireOwner, async (req, res) => {
-  const businessId = req.user.businessId;
-  const now = new Date();
-  const sevenAgo = new Date(now); sevenAgo.setDate(sevenAgo.getDate() - 7);
-  const fourteenAgo = new Date(now); fourteenAgo.setDate(fourteenAgo.getDate() - 14);
+  try {
+    const businessId = req.user.businessId;
+    const now = new Date();
+    const sevenAgo = new Date(now); sevenAgo.setDate(sevenAgo.getDate() - 7);
+    const fourteenAgo = new Date(now); fourteenAgo.setDate(fourteenAgo.getDate() - 14);
 
-  const inventory = (await pool.query('SELECT * FROM inventory_items WHERE business_id = $1', [businessId])).rows;
-  const thisWeek = (await pool.query('SELECT item_id, qty, unit_price FROM sales WHERE business_id = $1 AND occurred_at >= $2', [businessId, sevenAgo])).rows;
-  const lastWeek = (await pool.query('SELECT qty, unit_price FROM sales WHERE business_id = $1 AND occurred_at >= $2 AND occurred_at < $3', [businessId, fourteenAgo, sevenAgo])).rows;
-  const last14 = (await pool.query('SELECT DISTINCT item_id FROM sales WHERE business_id = $1 AND occurred_at >= $2', [businessId, fourteenAgo])).rows;
+    const inventory = (await pool.query('SELECT * FROM inventory_items WHERE business_id = $1', [businessId])).rows;
+    const thisWeek = (await pool.query('SELECT item_id, qty, unit_price FROM sales WHERE business_id = $1 AND occurred_at >= $2 AND voided_at IS NULL', [businessId, sevenAgo])).rows;
+    const lastWeek = (await pool.query('SELECT qty, unit_price FROM sales WHERE business_id = $1 AND occurred_at >= $2 AND occurred_at < $3 AND voided_at IS NULL', [businessId, fourteenAgo, sevenAgo])).rows;
+    const last14 = (await pool.query('SELECT DISTINCT item_id FROM sales WHERE business_id = $1 AND occurred_at >= $2 AND voided_at IS NULL', [businessId, fourteenAgo])).rows;
 
-  const revThis = thisWeek.reduce((s, r) => s + r.qty * r.unit_price, 0);
-  const revLast = lastWeek.reduce((s, r) => s + r.qty * r.unit_price, 0);
-  const pctChange = revLast > 0 ? ((revThis - revLast) / revLast) * 100 : null;
+    const revThis = thisWeek.reduce((s, r) => s + r.qty * r.unit_price, 0);
+    const revLast = lastWeek.reduce((s, r) => s + r.qty * r.unit_price, 0);
+    const pctChange = revLast > 0 ? ((revThis - revLast) / revLast) * 100 : null;
 
-  const costValue = inventory.reduce((s, i) => s + Number(i.cost_price) * i.stock, 0);
-  const retailValue = inventory.reduce((s, i) => s + Number(i.sale_price) * i.stock, 0);
+    const costValue = inventory.reduce((s, i) => s + Number(i.cost_price) * i.stock, 0);
+    const retailValue = inventory.reduce((s, i) => s + Number(i.sale_price) * i.stock, 0);
 
-  const velocity = {};
-  thisWeek.forEach((r) => { velocity[r.item_id] = (velocity[r.item_id] || 0) + r.qty; });
-  const runningOutSoon = inventory
-    .map((i) => { const dailyRate = (velocity[i.id] || 0) / 7; const daysLeft = dailyRate > 0 ? i.stock / dailyRate : Infinity; return { id: i.id, name: i.name, stock: i.stock, daysLeft }; })
-    .filter((i) => i.daysLeft < Infinity).sort((a, b) => a.daysLeft - b.daysLeft).slice(0, 5);
+    const velocity = {};
+    thisWeek.forEach((r) => { velocity[r.item_id] = (velocity[r.item_id] || 0) + r.qty; });
+    const runningOutSoon = inventory
+      .map((i) => { const dailyRate = (velocity[i.id] || 0) / 7; const daysLeft = dailyRate > 0 ? i.stock / dailyRate : Infinity; return { id: i.id, name: i.name, stock: i.stock, daysLeft }; })
+      .filter((i) => i.daysLeft < Infinity).sort((a, b) => a.daysLeft - b.daysLeft).slice(0, 5);
 
-  const soldIds = new Set(last14.map((r) => r.item_id));
-  const deadStock = inventory.filter((i) => i.stock > 0 && !soldIds.has(i.id))
-    .map((i) => ({ id: i.id, name: i.name, stock: i.stock, idleCapital: Number(i.cost_price) * i.stock })).slice(0, 5);
+    const soldIds = new Set(last14.map((r) => r.item_id));
+    const deadStock = inventory.filter((i) => i.stock > 0 && !soldIds.has(i.id))
+      .map((i) => ({ id: i.id, name: i.name, stock: i.stock, idleCapital: Number(i.cost_price) * i.stock })).slice(0, 5);
 
-  const marginChampions = [...inventory]
-    .map((i) => ({ id: i.id, name: i.name, margin: i.sale_price > 0 ? ((i.sale_price - i.cost_price) / i.sale_price) * 100 : 0, profitPerUnit: i.sale_price - i.cost_price }))
-    .sort((a, b) => b.margin - a.margin).slice(0, 5);
+    const marginChampions = [...inventory]
+      .map((i) => ({ id: i.id, name: i.name, margin: i.sale_price > 0 ? ((i.sale_price - i.cost_price) / i.sale_price) * 100 : 0, profitPerUnit: i.sale_price - i.cost_price }))
+      .sort((a, b) => b.margin - a.margin).slice(0, 5);
 
-  res.json({
-    capital: { costValue, retailValue, lockedProfit: retailValue - costValue },
-    weekOverWeek: { revenueThisWeek: revThis, revenueLastWeek: revLast, pctChange },
-    runningOutSoon, deadStock, marginChampions,
-  });
+    res.json({
+      capital: { costValue, retailValue, lockedProfit: retailValue - costValue },
+      weekOverWeek: { revenueThisWeek: revThis, revenueLastWeek: revLast, pctChange },
+      runningOutSoon, deadStock, marginChampions,
+    });
+  } catch (err) {
+    console.error('[/reports/insights] error:', err.message);
+    res.status(500).json({ error: 'Could not load insights' });
+  }
 });
 
 // --- SCAN A PAGE (photo → structured sales data via Gemini's vision API) ---
@@ -1071,6 +1277,11 @@ app.post('/ocr/parse-page', requireAuth, async (req, res) => {
     const quantityHint = mode === 'stock'
       ? `The person is in "Stock Arrival" mode — they're recording new stock coming IN. If a row has separate columns like "Qty Received"/"Stock In" vs "Qty Issued"/"Stock Out" vs "Balance", use the RECEIVED/STOCK-IN number as "quantity" and ignore the issued and balance numbers. If there's only one quantity on the line, use that.`
       : `The person is in "Recording Sales" mode — they're logging what was SOLD. If a row has separate columns like "Qty Issued"/"Stock Out"/"Sold" vs "Qty Received" vs "Balance", use the ISSUED/SOLD/STOCK-OUT number as "quantity" and ignore the received and balance numbers. A dash or blank in the issued column means nothing was sold on that row — skip that line entirely rather than inventing a number. If there's only one quantity on the line, use that.`;
+    const expiryHint =
+      `If a row has an expiry/expiration date, put it in "expiryDate" as strict YYYY-MM-DD. If only a month and year are ` +
+      `given (e.g. "January 2027" or "01/27"), use the LAST day of that month (e.g. "2027-01-31"), since the product is ` +
+      `valid through the end of that month. If no expiry is present or it's unreadable, use null — never guess a date. ` +
+      `If a row has a batch or lot number/code, put it in "batchNumber" exactly as written; otherwise null.`;
     const instructions =
       `This is a business's own sales or inventory ledger — it could be a photo of a handwritten/printed page, ` +
       `or text already extracted from that page (e.g. via Google Lens) and pasted in. Different businesses lay ` +
@@ -1081,11 +1292,11 @@ app.post('/ocr/parse-page', requireAuth, async (req, res) => {
       `expiry date, and multiple quantity columns all concatenated in sequence). Use context clues — units like ` +
       `cartons/packs/bottles, batch-code patterns, date-like tokens, keywords like "Delivered"/"Sold"/"Restocked" — ` +
       `to figure out where one row ends and the next begins. Do your best to pull real item lines out of that noise. ` +
-      `${quantityHint} ` +
+      `${quantityHint} ${expiryHint} ` +
       `Extract every line item you can make out. ${categoryHint} ` +
       `Respond with ONLY a JSON array — no explanation, no markdown code fences, no commentary before or after it, ` +
       `even if the input looks unusual or you're unsure. In this exact shape: ` +
-      `[{"description": "...", "quantity": number, "amount": number_or_null, "category": string_or_null}]. ` +
+      `[{"description": "...", "quantity": number, "amount": number_or_null, "category": string_or_null, "expiryDate": string_or_null, "batchNumber": string_or_null}]. ` +
       `If a quantity or amount is unreadable or absent, use null. Do not guess values that aren't actually there. ` +
       `If truly nothing on the page looks like an item line, respond with an empty array [].`;
 
@@ -1108,7 +1319,7 @@ app.post('/ocr/parse-page', requireAuth, async (req, res) => {
         body: JSON.stringify({
           contents: [{ role: 'user', parts }],
           generationConfig: {
-            maxOutputTokens: 1500,
+            maxOutputTokens: 8192,
             responseMimeType: 'application/json',
             responseSchema: {
               type: 'ARRAY',
@@ -1119,6 +1330,8 @@ app.post('/ocr/parse-page', requireAuth, async (req, res) => {
                   quantity: { type: 'NUMBER', nullable: true },
                   amount: { type: 'NUMBER', nullable: true },
                   category: { type: 'STRING', nullable: true },
+                  expiryDate: { type: 'STRING', nullable: true },
+                  batchNumber: { type: 'STRING', nullable: true },
                 },
                 required: ['description'],
               },
@@ -1134,6 +1347,7 @@ app.post('/ocr/parse-page', requireAuth, async (req, res) => {
       return res.status(502).json({ error: 'Vision extraction failed', debug: aiData?.error?.message || JSON.stringify(aiData).slice(0, 500) });
     }
 
+    const finishReason = aiData.candidates?.[0]?.finishReason;
     const text = (aiData.candidates?.[0]?.content?.parts || []).map((p) => p.text || '').join('').trim();
     // Don't assume the whole response is pure JSON — strip fences if present,
     // then pull out the first [...] block from wherever it actually sits in
@@ -1150,6 +1364,15 @@ app.post('/ocr/parse-page', requireAuth, async (req, res) => {
       if (!Array.isArray(rows)) throw new Error('not an array');
     } catch (e) {
       console.error('[ocr] could not parse Gemini output:', text);
+      if (finishReason === 'MAX_TOKENS') {
+        // The response was cut off mid-generation — too many line items for
+        // one request, not a formatting problem. Splitting the input is the
+        // actual fix here, not a clearer photo.
+        return res.status(502).json({
+          error: 'This page has too many line items to process in one go — try splitting it into two smaller photos or pastes.',
+          debug: `Response was truncated at the token limit (finishReason: MAX_TOKENS). Partial output: ${text.slice(-300)}`,
+        });
+      }
       return res.status(502).json({
         error: hasImage ? 'Could not parse extracted data — try a clearer photo' : 'Could not parse the pasted text — check it copied over correctly',
         // Raw model output, truncated — lets you see exactly what it said
@@ -1164,11 +1387,17 @@ app.post('/ocr/parse-page', requireAuth, async (req, res) => {
       const match = fuzzyMatchItem(row.description, inventory);
       const qty = row.quantity || 1;
       const unitPrice = match ? Number(match.item.sale_price) : null;
+      // Only pass through a date that actually matches the format we asked
+      // for — protects the frontend's <input type="date"> from receiving
+      // something malformed if the model didn't follow instructions exactly.
+      const validExpiry = row.expiryDate && /^\d{4}-\d{2}-\d{2}$/.test(row.expiryDate) ? row.expiryDate : null;
       return {
         rawDescription: row.description,
         quantity: qty,
         amountOnPage: row.amount,
         suggestedCategory: row.category || null,
+        suggestedExpiryDate: validExpiry,
+        suggestedBatchNumber: row.batchNumber || null,
         matchedItem: match ? { id: match.item.id, name: match.item.name, confidence: Number(match.confidence.toFixed(2)) } : null,
         suggestedTotal: unitPrice ? unitPrice * qty : row.amount,
         needsReview: !match || match.confidence < 0.6,
