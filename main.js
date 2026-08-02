@@ -17,6 +17,9 @@ const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const cron = require('node-cron');
+const crypto = require('crypto'); // built-in — used for Paystack webhook signature verification
+// New dependency — run: npm install @simplewebauthn/server
+const { generateRegistrationOptions, verifyRegistrationResponse, generateAuthenticationOptions, verifyAuthenticationResponse } = require('@simplewebauthn/server');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -118,6 +121,31 @@ CREATE TABLE IF NOT EXISTS users (
   phone TEXT NOT NULL UNIQUE,
   pin_hash TEXT NOT NULL,
   role TEXT NOT NULL CHECK (role IN ('owner', 'staff')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Email is needed to create a Paystack customer (required by their API) —
+-- nullable since it predates this feature and isn't needed for anything else.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT;
+
+-- Paystack Dedicated Virtual Account details, once the owner sets one up —
+-- one bank account per business, permanently theirs, any transfer to it is
+-- auto-detected via webhook. Nothing here until they set it up.
+ALTER TABLE businesses ADD COLUMN IF NOT EXISTS paystack_customer_code TEXT;
+ALTER TABLE businesses ADD COLUMN IF NOT EXISTS dva_account_number TEXT;
+ALTER TABLE businesses ADD COLUMN IF NOT EXISTS dva_account_name TEXT;
+ALTER TABLE businesses ADD COLUMN IF NOT EXISTS dva_bank_name TEXT;
+
+-- Face ID / biometric login credentials (WebAuthn), owner-only by design —
+-- this is for a personal device, not a shared shop terminal, so it's tied
+-- to a specific user, not the business.
+CREATE TABLE IF NOT EXISTS webauthn_credentials (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  credential_id TEXT NOT NULL UNIQUE,
+  public_key TEXT NOT NULL,
+  counter BIGINT NOT NULL DEFAULT 0,
+  device_label TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -234,6 +262,56 @@ function logAudit(businessId, user, action, details) {
     'INSERT INTO audit_log (business_id, user_id, user_name, action, details) VALUES ($1, $2, $3, $4, $5)',
     [businessId, user?.userId || null, user?.name || null, action, details || null]
   ).catch((err) => console.error('[audit] log failed:', err.message));
+}
+
+// ----------------------------------------------------------------------------
+// PAYSTACK HELPER
+// ----------------------------------------------------------------------------
+async function paystackRequest(path, method, body) {
+  const res = await fetch(`https://api.paystack.co${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await res.json();
+  if (!data.status) {
+    // Paystack's own error message is far more useful than a generic one —
+    // e.g. "Your business needs to go live before you can create dedicated
+    // virtual accounts" tells you exactly what to fix, a generic 500 doesn't.
+    const err = new Error(data.message || 'Paystack request failed');
+    err.paystackResponse = data;
+    throw err;
+  }
+  return data;
+}
+
+// ----------------------------------------------------------------------------
+// WEBAUTHN (FACE ID / BIOMETRIC LOGIN) CONFIG
+// ----------------------------------------------------------------------------
+// These MUST match your actual production frontend domain exactly, or every
+// WebAuthn registration/login will fail — the browser enforces this strictly
+// as an anti-phishing protection, it's not optional or a soft warning.
+// WEBAUTHN_RP_ID is just the domain (e.g. "todaybreadify.app", no https://,
+// no path). WEBAUTHN_ORIGIN is the full origin (e.g. "https://todaybreadify.app").
+const WEBAUTHN_RP_ID = process.env.WEBAUTHN_RP_ID || 'localhost';
+const WEBAUTHN_ORIGIN = process.env.WEBAUTHN_ORIGIN || 'http://localhost:3000';
+const WEBAUTHN_RP_NAME = 'TodayBread';
+
+// Short-lived, in-memory challenge storage — same pattern as loginAttempts.
+// Registration is keyed by userId (always logged-in-via-PIN first), login is
+// keyed by phone number (not logged in yet). 2-minute expiry either way.
+const webauthnChallenges = new Map();
+function storeChallenge(key, challenge) {
+  webauthnChallenges.set(key, { challenge, expiresAt: Date.now() + 2 * 60 * 1000 });
+}
+function takeChallenge(key) {
+  const entry = webauthnChallenges.get(key);
+  webauthnChallenges.delete(key);
+  if (!entry || entry.expiresAt < Date.now()) return null;
+  return entry.challenge;
 }
 
 // ----------------------------------------------------------------------------
@@ -386,7 +464,10 @@ function scheduleSubscriptionReminderJob() {
 // ----------------------------------------------------------------------------
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '10mb' }));
+// Also stash the raw bytes of every request body — Paystack's webhook
+// signature is an HMAC over the exact original bytes, which re-serializing
+// req.body back to JSON would not reliably reproduce.
+app.use(express.json({ limit: '10mb', verify: (req, res, buf) => { req.rawBody = buf; } }));
 
 app.get('/health', (req, res) => res.json({ ok: true }));
 
@@ -615,16 +696,248 @@ app.post('/auth/reset-pin', requireAuth, async (req, res) => {
 app.get('/me', requireAuth, async (req, res) => {
   try {
     const business = await pool.query(
-      'SELECT id, name, address, whatsapp_number, created_at, trial_ends_at, next_due_date, monthly_fee, slug, industry FROM businesses WHERE id = $1',
+      `SELECT id, name, address, whatsapp_number, created_at, trial_ends_at, next_due_date, monthly_fee, slug, industry,
+              dva_account_number, dva_account_name, dva_bank_name
+       FROM businesses WHERE id = $1`,
       [req.user.businessId]
     );
+    const bioCheck = await pool.query('SELECT count(*)::int AS count FROM webauthn_credentials WHERE user_id = $1', [req.user.userId]);
     res.json({
-      user: { id: req.user.userId, name: req.user.name, role: req.user.role },
+      user: { id: req.user.userId, name: req.user.name, role: req.user.role, biometricsEnrolled: bioCheck.rows[0].count > 0 },
       business: business.rows[0] || null,
     });
   } catch (err) {
     console.error('[/me] error:', err.message);
     res.status(500).json({ error: 'Could not load account info' });
+  }
+});
+
+// --- SUBSCRIPTION PAYMENT (PAYSTACK, TRANSFER-ONLY VIA DEDICATED VIRTUAL ACCOUNT) ---
+
+// POST /subscription/setup-payment-account — creates (or returns the existing)
+// Paystack customer + Dedicated Virtual Account for this business, so the
+// owner has one permanent bank account number to transfer their subscription
+// fee to each month. Requires Paystack's "go-live" process to be completed on
+// your account — this will fail with Paystack's own explanation if it isn't.
+app.post('/subscription/setup-payment-account', requireAuth, requireOwner, async (req, res) => {
+  const { email } = req.body;
+  if (!email || !email.includes('@')) return res.status(400).json({ error: 'A valid email is required' });
+  if (!process.env.PAYSTACK_SECRET_KEY) return res.status(500).json({ error: 'PAYSTACK_SECRET_KEY is not configured on the server' });
+
+  try {
+    const existing = await pool.query('SELECT dva_account_number, dva_account_name, dva_bank_name FROM businesses WHERE id = $1', [req.user.businessId]);
+    if (existing.rows[0]?.dva_account_number) {
+      // Already set up — just save the email if it changed, return what exists.
+      await pool.query('UPDATE users SET email = $1 WHERE id = $2', [email, req.user.userId]);
+      return res.json({
+        accountNumber: existing.rows[0].dva_account_number,
+        accountName: existing.rows[0].dva_account_name,
+        bankName: existing.rows[0].dva_bank_name,
+      });
+    }
+
+    await pool.query('UPDATE users SET email = $1 WHERE id = $2', [email, req.user.userId]);
+    const [firstName, ...rest] = (req.user.name || 'Owner').trim().split(' ');
+    const lastName = rest.join(' ') || firstName;
+
+    const customer = await paystackRequest('/customer', 'POST', {
+      email, first_name: firstName, last_name: lastName,
+    });
+    const customerCode = customer.data.customer_code;
+
+    const dva = await paystackRequest('/dedicated_account', 'POST', {
+      customer: customerCode,
+      preferred_bank: 'wema-bank',
+    });
+
+    await pool.query(
+      `UPDATE businesses SET paystack_customer_code = $1, dva_account_number = $2, dva_account_name = $3, dva_bank_name = $4
+       WHERE id = $5`,
+      [customerCode, dva.data.account_number, dva.data.account_name, dva.data.bank.name, req.user.businessId]
+    );
+
+    res.json({ accountNumber: dva.data.account_number, accountName: dva.data.account_name, bankName: dva.data.bank.name });
+  } catch (err) {
+    console.error('[/subscription/setup-payment-account] error:', err.message);
+    res.status(502).json({ error: 'Could not set up payment account', debug: err.paystackResponse?.message || err.message });
+  }
+});
+
+// POST /webhooks/paystack — Paystack calls this whenever a payment event
+// happens on your account. We only act on charge.success events that came
+// through a dedicated virtual account, matched to a business by its Paystack
+// customer code. No auth (Paystack can't send a bearer token) — the HMAC
+// signature check below is what proves this request really came from Paystack.
+app.post('/webhooks/paystack', async (req, res) => {
+  const signature = req.headers['x-paystack-signature'];
+  if (!process.env.PAYSTACK_SECRET_KEY || !req.rawBody) return res.sendStatus(400);
+  const expected = crypto.createHmac('sha512', process.env.PAYSTACK_SECRET_KEY).update(req.rawBody).digest('hex');
+  if (signature !== expected) {
+    console.warn('[paystack-webhook] signature mismatch — ignoring');
+    return res.sendStatus(401);
+  }
+  // Acknowledge immediately — Paystack retries if it doesn't get a fast 200,
+  // and the actual processing below doesn't need to block the response.
+  res.sendStatus(200);
+
+  try {
+    const event = req.body;
+    if (event.event !== 'charge.success') return;
+    const data = event.data;
+    const customerCode = data.customer?.customer_code;
+    if (!customerCode) return;
+
+    const bizResult = await pool.query('SELECT id, name, monthly_fee FROM businesses WHERE paystack_customer_code = $1', [customerCode]);
+    const business = bizResult.rows[0];
+    if (!business) { console.warn('[paystack-webhook] no business matches customer', customerCode); return; }
+
+    const amountReceived = Number(data.amount) / 100; // Paystack sends kobo
+    await pool.query(
+      `UPDATE businesses SET next_due_date = COALESCE(next_due_date, now()) + interval '30 days', reminder_sent_for_due_date = NULL
+       WHERE id = $1`,
+      [business.id]
+    );
+    logAudit(business.id, { userId: null, name: 'Paystack' }, 'subscription_paid', `Subscription paid via bank transfer: ${naira(amountReceived)} received (expected ${naira(business.monthly_fee)})`);
+    console.log(`[paystack-webhook] subscription extended for ${business.name} — ${naira(amountReceived)} received`);
+  } catch (err) {
+    console.error('[paystack-webhook] processing error:', err.message);
+  }
+});
+
+// --- FACE ID / BIOMETRIC LOGIN (WEBAUTHN), OWNER ONLY ---
+// This is scoped to the owner's own personal device on purpose — it enrolls
+// ONE device's biometric sensor to ONE user account. That fits an owner's own
+// phone; it doesn't fit a shared shop terminal where staff rotate, so staff
+// keep using phone+PIN.
+
+// Step 1 of registration: server issues a challenge, browser asks the device
+// to create a new biometric credential. Requires being logged in via PIN first.
+app.post('/auth/webauthn/register-options', requireAuth, requireOwner, async (req, res) => {
+  try {
+    const existingCreds = await pool.query('SELECT credential_id FROM webauthn_credentials WHERE user_id = $1', [req.user.userId]);
+    const options = await generateRegistrationOptions({
+      rpName: WEBAUTHN_RP_NAME,
+      rpID: WEBAUTHN_RP_ID,
+      userID: Buffer.from(req.user.userId),
+      userName: req.user.name || 'Owner',
+      attestationType: 'none',
+      excludeCredentials: existingCreds.rows.map((c) => ({ id: c.credential_id, type: 'public-key' })),
+      // 'platform' restricts this to the device's built-in sensor (Face ID,
+      // Touch ID, Android fingerprint/face unlock) rather than external
+      // security keys, which is what "Face ID / biometrics" actually means here.
+      authenticatorSelection: { residentKey: 'preferred', userVerification: 'preferred', authenticatorAttachment: 'platform' },
+    });
+    storeChallenge(`reg:${req.user.userId}`, options.challenge);
+    res.json(options);
+  } catch (err) {
+    console.error('[webauthn register-options] error:', err.message);
+    res.status(500).json({ error: 'Could not start biometric registration' });
+  }
+});
+
+// Step 2 of registration: browser sends back what the device signed, server
+// verifies it and stores the credential permanently.
+app.post('/auth/webauthn/register-verify', requireAuth, requireOwner, async (req, res) => {
+  try {
+    const expectedChallenge = takeChallenge(`reg:${req.user.userId}`);
+    if (!expectedChallenge) return res.status(400).json({ error: 'Registration session expired — try again' });
+    const verification = await verifyRegistrationResponse({
+      response: req.body,
+      expectedChallenge,
+      expectedOrigin: WEBAUTHN_ORIGIN,
+      expectedRPID: WEBAUTHN_RP_ID,
+    });
+    if (!verification.verified || !verification.registrationInfo) {
+      return res.status(400).json({ error: 'Could not verify biometric registration' });
+    }
+    // NOTE: @simplewebauthn/server's return shape here has changed across
+    // major versions. This targets v10+ (registrationInfo.credential.{id,
+    // publicKey, counter}). If you're on an older version, check that
+    // package's docs — it may be registrationInfo.credentialID /
+    // credentialPublicKey / counter directly instead.
+    const { credential } = verification.registrationInfo;
+    await pool.query(
+      'INSERT INTO webauthn_credentials (user_id, credential_id, public_key, counter, device_label) VALUES ($1, $2, $3, $4, $5)',
+      [req.user.userId, credential.id, Buffer.from(credential.publicKey).toString('base64url'), credential.counter, req.body.deviceLabel || 'This device']
+    );
+    res.json({ verified: true });
+  } catch (err) {
+    console.error('[webauthn register-verify] error:', err.message);
+    res.status(500).json({ error: 'Could not verify biometric registration', debug: err.message });
+  }
+});
+
+// Step 1 of login: given a phone number (not authenticated yet), issue a
+// challenge scoped to that user's enrolled credentials.
+app.post('/auth/webauthn/login-options', async (req, res) => {
+  const { phone } = req.body;
+  if (!phone) return res.status(400).json({ error: 'phone is required' });
+  try {
+    const userResult = await pool.query('SELECT id FROM users WHERE phone = $1', [phone]);
+    const user = userResult.rows[0];
+    if (!user) return res.status(404).json({ error: 'No account found for that phone number' });
+    const creds = await pool.query('SELECT credential_id FROM webauthn_credentials WHERE user_id = $1', [user.id]);
+    if (creds.rows.length === 0) return res.status(404).json({ error: 'Biometric login is not set up for this account' });
+    const options = await generateAuthenticationOptions({
+      rpID: WEBAUTHN_RP_ID,
+      allowCredentials: creds.rows.map((c) => ({ id: c.credential_id, type: 'public-key' })),
+      userVerification: 'preferred',
+    });
+    storeChallenge(`login:${phone}`, options.challenge);
+    res.json(options);
+  } catch (err) {
+    console.error('[webauthn login-options] error:', err.message);
+    res.status(500).json({ error: 'Could not start biometric login' });
+  }
+});
+
+// Step 2 of login: verify the signed challenge, issue a normal JWT — from
+// here on it behaves exactly like a PIN login.
+app.post('/auth/webauthn/login-verify', async (req, res) => {
+  const { phone, response } = req.body;
+  if (!phone || !response) return res.status(400).json({ error: 'phone and response are required' });
+  try {
+    const expectedChallenge = takeChallenge(`login:${phone}`);
+    if (!expectedChallenge) return res.status(400).json({ error: 'Login session expired — try again' });
+
+    const userResult = await pool.query('SELECT * FROM users WHERE phone = $1', [phone]);
+    const user = userResult.rows[0];
+    if (!user) return res.status(404).json({ error: 'Account not found' });
+
+    const credResult = await pool.query('SELECT * FROM webauthn_credentials WHERE user_id = $1 AND credential_id = $2', [user.id, response.id]);
+    const stored = credResult.rows[0];
+    if (!stored) return res.status(400).json({ error: 'Unrecognized credential' });
+
+    const verification = await verifyAuthenticationResponse({
+      response,
+      expectedChallenge,
+      expectedOrigin: WEBAUTHN_ORIGIN,
+      expectedRPID: WEBAUTHN_RP_ID,
+      credential: {
+        id: stored.credential_id,
+        publicKey: Buffer.from(stored.public_key, 'base64url'),
+        counter: Number(stored.counter),
+      },
+    });
+    if (!verification.verified) return res.status(401).json({ error: 'Biometric verification failed' });
+
+    await pool.query('UPDATE webauthn_credentials SET counter = $1 WHERE id = $2', [verification.authenticationInfo.newCounter, stored.id]);
+    res.json({ token: signToken(user), user: { id: user.id, name: user.name, role: user.role, businessId: user.business_id } });
+  } catch (err) {
+    console.error('[webauthn login-verify] error:', err.message);
+    res.status(500).json({ error: 'Could not verify biometric login', debug: err.message });
+  }
+});
+
+// Turns off biometric login on this account (e.g. got a new phone) — owner
+// can always re-enroll from Settings afterward.
+app.delete('/auth/webauthn/credentials', requireAuth, requireOwner, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM webauthn_credentials WHERE user_id = $1', [req.user.userId]);
+    res.json({ removed: true });
+  } catch (err) {
+    console.error('[DELETE /auth/webauthn/credentials] error:', err.message);
+    res.status(500).json({ error: 'Could not remove biometric login' });
   }
 });
 
