@@ -2059,36 +2059,132 @@ async function callGeminiWithRetry(baseRequestBody) {
   throw lastErr; // every model, every attempt, exhausted
 }
 
-// Cross-provider fallback — only reached once EVERY Gemini model and every
-// retry in callGeminiWithRetry has been exhausted. Different vendor, so a
-// Google-side outage doesn't take this feature down entirely. gpt-4o is a
-// long-stable model name (out since May 2024, still supported broadly as of
-// this writing) — deliberately not chasing OpenAI's newest alias the way the
-// Gemini naming chase burned us, but model names age; verify this is still
-// current if it's ever actually invoked and errors with a "model not found".
-async function callOpenAIVisionFallback({ systemPrompt, instructions, imageBase64, mediaType, pastedText }) {
-  if (!process.env.OPENAI_API_KEY) {
-    const err = new Error('OPENAI_API_KEY is not configured — cross-provider fallback unavailable');
+// ----------------------------------------------------------------------------
+// TWO-PASS EXTRACTION — separates "read the messy image" from "produce
+// valid structured JSON" into two distinct calls instead of asking one
+// model to do both at once. Constrained JSON decoding while simultaneously
+// parsing dense handwriting is exactly the tension behind the earlier
+// runaway-number bug and the "only found 1 of 16 lines" inconsistency — a
+// model juggling both tends to under-perform at each. Pass 1 (vendor-
+// specific, vision) just transcribes every visible line as plain text, no
+// format constraint at all. Pass 2 (one shared, cheap, text-only call)
+// turns that already-clean transcript into the structured JSON the rest of
+// the app expects — this step no longer needs to READ anything, just
+// reformat known-good text, which is a far easier task to get reliably
+// right under a strict schema.
+//
+// Claude is the primary vision reader (best real-world accuracy on messy
+// handwritten pages, confirmed directly against this exact ledger in
+// conversation before this was built). Gemini and OpenAI's two-pass
+// transcriptions are only run — in parallel — if Claude's result is
+// missing, errored, or suspiciously thin (≤1 row on an image, the exact
+// symptom that motivated this rebuild), and whichever of all three
+// attempts is most complete wins. Pasted text skips vision entirely and
+// goes straight to structuring, since it's already "transcribed".
+// ----------------------------------------------------------------------------
+
+const TRANSCRIBE_INSTRUCTIONS =
+  `Transcribe EVERY line of text visible on this page, exactly as written, in top-to-bottom reading order — one ` +
+  `line of output per line on the page. Do not interpret, categorize, total, compute, or omit anything; this pass ` +
+  `is transcription only, not extraction. If a line is crossed out, struck through, or visibly cancelled, skip it ` +
+  `entirely rather than transcribing it — the business has already rejected that line. If a portion is genuinely ` +
+  `illegible, write [illegible] in its place rather than guessing at it. Do not add commentary, headers, page ` +
+  `numbers, or explanation — output only the transcribed lines themselves, nothing else.`;
+
+// Pulls a rows array out of raw model text — strips markdown fences if
+// present, then grabs the first [...] block from wherever it sits (models
+// occasionally add a stray sentence before/after the JSON).
+function extractRowsFromText(rawText) {
+  const fenceStripped = rawText.replace(/```json\s*|```/g, '');
+  const arrayMatch = fenceStripped.match(/\[[\s\S]*\]/);
+  const cleaned = arrayMatch ? arrayMatch[0] : fenceStripped;
+  const parsed = JSON.parse(cleaned);
+  const rowsOut = Array.isArray(parsed) ? parsed : (parsed.items || parsed.rows || parsed.lines || []);
+  if (!Array.isArray(rowsOut)) throw new Error('not an array');
+  return rowsOut;
+}
+
+// Primary vision reader. Model string per Anthropic's current lineup —
+// verify this is still current if it ever errors with a "model not found".
+async function transcribeWithClaude(imageBase64, mediaType) {
+  if (!process.env.ANTHROPIC_API_KEY) {
+    const err = new Error('ANTHROPIC_API_KEY is not configured');
     err.transient = false;
     throw err;
   }
-  const userContent = imageBase64
-    ? [
-        { type: 'text', text: instructions },
-        { type: 'image_url', image_url: { url: `data:${mediaType || 'image/jpeg'};base64,${imageBase64}` } },
-      ]
-    : [{ type: 'text', text: `${instructions}\n\nHere is the pasted ledger text:\n\n${pastedText}` }];
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': process.env.ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model: 'claude-sonnet-5',
+      max_tokens: 4096,
+      system: RECEIPT_PARSER_SYSTEM_PROMPT,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image', source: { type: 'base64', media_type: mediaType || 'image/jpeg', data: imageBase64 } },
+          { type: 'text', text: TRANSCRIBE_INSTRUCTIONS },
+        ],
+      }],
+    }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    const err = new Error(data?.error?.message || `Claude API error (${res.status})`);
+    err.transient = res.status === 429 || res.status === 503 || res.status === 529;
+    throw err;
+  }
+  return (data.content || []).map((b) => b.text || '').join('').trim();
+}
 
+// Escalation vendor #1. Reuses the existing retry/model-fallback machinery
+// (callGeminiWithRetry) but asks for plain text, not schema-constrained
+// JSON — no numeric fields at all in this pass, so the original runaway-
+// digit failure mode literally cannot occur here.
+async function transcribeWithGemini(imageBase64, mediaType) {
+  const aiRes = await callGeminiWithRetry({
+    systemInstruction: { role: 'system', parts: [{ text: RECEIPT_PARSER_SYSTEM_PROMPT }] },
+    contents: [{
+      role: 'user',
+      parts: [
+        { text: TRANSCRIBE_INSTRUCTIONS },
+        { inline_data: { mime_type: mediaType || 'image/jpeg', data: imageBase64 } },
+      ],
+    }],
+    generationConfig: { maxOutputTokens: 4096 },
+  });
+  return (aiRes.aiData.candidates?.[0]?.content?.parts || []).map((p) => p.text || '').join('').trim();
+}
+
+// Escalation vendor #2. Different company from Gemini, so a Google-side
+// outage doesn't take the escalation path down with it. gpt-4o is a long-
+// stable model name — verify this is still current if it ever errors with
+// a "model not found".
+async function transcribeWithOpenAI(imageBase64, mediaType) {
+  if (!process.env.OPENAI_API_KEY) {
+    const err = new Error('OPENAI_API_KEY is not configured');
+    err.transient = false;
+    throw err;
+  }
   const res = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
     body: JSON.stringify({
       model: 'gpt-4o',
       messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userContent },
+        { role: 'system', content: RECEIPT_PARSER_SYSTEM_PROMPT },
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: TRANSCRIBE_INSTRUCTIONS },
+            { type: 'image_url', image_url: { url: `data:${mediaType || 'image/jpeg'};base64,${imageBase64}` } },
+          ],
+        },
       ],
-      response_format: { type: 'json_object' },
       max_tokens: 4096,
     }),
   });
@@ -2101,13 +2197,88 @@ async function callOpenAIVisionFallback({ systemPrompt, instructions, imageBase6
   return data.choices?.[0]?.message?.content || '';
 }
 
+// Builds pass-2's instructions — grounded in this business's real
+// categories and the sales/stock mode, same logic as before, just now fed
+// clean transcript text instead of an image.
+function buildStructuringInstructions(knownCategories, mode) {
+  const categoryHint = knownCategories.length > 0
+    ? `This business's known categories are: ${knownCategories.join(', ')}. For each line, suggest the closest fitting category from that list, or null if genuinely none fit. Don't invent a new category name.`
+    : `This business has no categories set up yet — leave "category" null for every line.`;
+  const quantityHint = mode === 'stock'
+    ? `The person is in "Stock Arrival" mode — they're recording new stock coming IN. If a row has separate columns like "Qty Received"/"Stock In" vs "Qty Issued"/"Stock Out" vs "Balance", use the RECEIVED/STOCK-IN number as "quantity" and ignore the issued and balance numbers. If there's only one quantity on the line, use that.`
+    : `The person is in "Recording Sales" mode — they're logging what was SOLD. If a row has separate columns like "Qty Issued"/"Stock Out"/"Sold" vs "Qty Received" vs "Balance", use the ISSUED/SOLD/STOCK-OUT number as "quantity" and ignore the received and balance numbers. A dash or blank in the issued column means nothing was sold on that row — skip that line entirely rather than inventing a number. If there's only one quantity on the line, use that.`;
+  const expiryHint =
+    `If a row has an expiry/expiration date, put it in "expiryDate" as strict YYYY-MM-DD. If only a month and year are ` +
+    `given (e.g. "January 2027" or "01/27"), use the LAST day of that month (e.g. "2027-01-31"), since the product is ` +
+    `valid through the end of that month. If no expiry is present or it's unreadable, use null — never guess a date. ` +
+    `If a row has a batch or lot number/code, put it in "batchNumber" exactly as written; otherwise null.`;
+  return (
+    `Below is a business's own sales or inventory ledger, already transcribed line-by-line from a photo (or pasted ` +
+    `directly as text). Turn it into structured rows. Different businesses lay this out differently (item then ` +
+    `price, qty x item @unit price, shorthand abbreviations, etc.) — read whatever structure is actually there. ` +
+    `${quantityHint} ${expiryHint} Extract every line item present — do not skip or truncate any of them. ${categoryHint} ` +
+    `Respond with ONLY the structured JSON — no explanation, no markdown code fences, no commentary. In this exact shape: ` +
+    `{"items": [{"description": "...", "quantity": number, "amount": number_or_null, "category": string_or_null, "expiryDate": string_or_null, "batchNumber": string_or_null}]}. ` +
+    `"quantity" and "amount" must be plain numeric strings ONLY (e.g. "3", "23550") — digits and at most one ` +
+    `decimal point, nothing else, no currency symbols, no commas, no units. If you are not confident of the exact ` +
+    `digits, use null rather than guessing — never pad, repeat, or extend a number's digits under any circumstance. ` +
+    `"amount" is the TOTAL ₦ value written for that line, already covering all units on that line (e.g. "Baby ` +
+    `Diaper 1pack ₦5000" → amount "5000"; "Indomie 3carton ₦23550" → amount "23550", not divided by 3). Never ` +
+    `compute or guess a per-unit price yourself. If a quantity or amount is unreadable or absent, use null. ` +
+    `If truly nothing looks like an item line, respond with {"items": []}.`
+  );
+}
+
+// The shared pass-2 call — deliberately Gemini, text-only, since this step
+// no longer needs vision at all, just reliable reformatting of text that's
+// already known to be accurate. Self-repairs once via repairMalformedJson
+// on a malformed response, same pattern as before.
+async function structureTranscript(rawTranscript, knownCategories, mode) {
+  const instructions = buildStructuringInstructions(knownCategories, mode);
+  const aiRes = await callGeminiWithRetry({
+    contents: [{ role: 'user', parts: [{ text: `${instructions}\n\nTranscribed ledger:\n\n${rawTranscript}` }] }],
+    generationConfig: {
+      maxOutputTokens: 16384,
+      temperature: 0.1,
+      responseMimeType: 'application/json',
+      responseSchema: {
+        type: 'OBJECT',
+        properties: {
+          items: {
+            type: 'ARRAY',
+            items: {
+              type: 'OBJECT',
+              properties: {
+                description: { type: 'STRING' },
+                quantity: { type: 'STRING', nullable: true },
+                amount: { type: 'STRING', nullable: true },
+                category: { type: 'STRING', nullable: true },
+                expiryDate: { type: 'STRING', nullable: true },
+                batchNumber: { type: 'STRING', nullable: true },
+              },
+              required: ['description'],
+            },
+          },
+        },
+        required: ['items'],
+      },
+    },
+  });
+  const text = (aiRes.aiData.candidates?.[0]?.content?.parts || []).map((p) => p.text || '').join('').trim();
+  try {
+    return extractRowsFromText(text);
+  } catch (parseErr) {
+    const repairedText = await repairMalformedJson(text);
+    return extractRowsFromText(repairedText);
+  }
+}
+
 // Self-repair — one single follow-up call when the model's own output came
 // back malformed (truncated JSON, stray commentary, a fence that wasn't
-// stripped cleanly). This has been the actual recurring failure pattern —
-// not the request failing outright, but the response itself being broken.
-// Deliberately text-only and provider-agnostic: fixing already-written text
-// into valid JSON doesn't need vision, so this always uses Gemini's cheapest
-// tier regardless of which provider produced the original broken output.
+// stripped cleanly). Deliberately text-only and provider-agnostic — fixing
+// already-written text into valid JSON doesn't need vision, so this always
+// uses Gemini's cheapest tier regardless of which pass produced the broken
+// output.
 async function repairMalformedJson(rawText) {
   const repairPrompt =
     `The following text was supposed to be a single valid JSON object matching this exact shape: ` +
@@ -2155,204 +2326,78 @@ app.post('/ocr/parse-page', requireAuth, ocrRateLimit, async (req, res) => {
     );
     const knownCategories = categoryRows.rows.map((r) => r.category);
 
-    // Every business writes their sales/stock ledger differently — some list
-    // "item — qty — price", some do "qty x item @unit price", some just
-    // scrawl shorthand. We don't enforce a format; instead the prompt asks
-    // Gemini to interpret whatever structure is actually on the page/text.
-    const categoryHint = knownCategories.length > 0
-      ? `This business's known categories are: ${knownCategories.join(', ')}. For each line, suggest the closest fitting category from that list, or null if genuinely none fit. Don't invent a new category name.`
-      : `This business has no categories set up yet — leave "category" null for every line.`;
-    // Some ledgers (especially pharmacy-style stock registers) have SEPARATE
-    // columns for stock received, stock issued/sold, and running balance —
-    // all for the same item, on the same row. Without knowing which one the
-    // person actually wants, "quantity" is ambiguous. The current Notebook
-    // mode disambiguates this.
-    const quantityHint = mode === 'stock'
-      ? `The person is in "Stock Arrival" mode — they're recording new stock coming IN. If a row has separate columns like "Qty Received"/"Stock In" vs "Qty Issued"/"Stock Out" vs "Balance", use the RECEIVED/STOCK-IN number as "quantity" and ignore the issued and balance numbers. If there's only one quantity on the line, use that.`
-      : `The person is in "Recording Sales" mode — they're logging what was SOLD. If a row has separate columns like "Qty Issued"/"Stock Out"/"Sold" vs "Qty Received" vs "Balance", use the ISSUED/SOLD/STOCK-OUT number as "quantity" and ignore the received and balance numbers. A dash or blank in the issued column means nothing was sold on that row — skip that line entirely rather than inventing a number. If there's only one quantity on the line, use that.`;
-    const expiryHint =
-      `If a row has an expiry/expiration date, put it in "expiryDate" as strict YYYY-MM-DD. If only a month and year are ` +
-      `given (e.g. "January 2027" or "01/27"), use the LAST day of that month (e.g. "2027-01-31"), since the product is ` +
-      `valid through the end of that month. If no expiry is present or it's unreadable, use null — never guess a date. ` +
-      `If a row has a batch or lot number/code, put it in "batchNumber" exactly as written; otherwise null.`;
-    const instructions =
-      `This is a business's own sales or inventory ledger — it could be a photo of a handwritten/printed page, ` +
-      `or text already extracted from that page (e.g. via Google Lens) and pasted in. Different businesses lay ` +
-      `this out differently (item then price, qty x item @unit price, shorthand abbreviations, etc.) — read ` +
-      `whatever structure is actually there rather than expecting one fixed format. Lens-extracted text especially ` +
-      `can be messy — numbers fused to words, stray brackets or symbols from table borders, misaligned columns, ` +
-      `and entire rows run together with no clear line breaks between them (e.g. a date, item name, batch code, ` +
-      `expiry date, and multiple quantity columns all concatenated in sequence). Use context clues — units like ` +
-      `cartons/packs/bottles, batch-code patterns, date-like tokens, keywords like "Delivered"/"Sold"/"Restocked" — ` +
-      `to figure out where one row ends and the next begins. Do your best to pull real item lines out of that noise. ` +
-      `${quantityHint} ${expiryHint} ` +
-      `Extract every line item you can make out. Scan the ENTIRE page from top to bottom, including the last few ` +
-      `rows near the bottom edge and any items after a subtotal or partial total line — do not stop early or ` +
-      `truncate the list once you've found several items; a page commonly has 15-30+ rows and all of them matter ` +
-      `equally, not just the first few. ${categoryHint} ` +
-      `Respond with ONLY the structured JSON — no explanation, no markdown code fences, no commentary before or after it, ` +
-      `even if the input looks unusual or you're unsure. In this exact shape: ` +
-      `{"items": [{"description": "...", "quantity": number, "amount": number_or_null, "category": string_or_null, "expiryDate": string_or_null, "batchNumber": string_or_null}]}. ` +
-      `"quantity" and "amount" must be plain numeric strings ONLY (e.g. "3", "23550") — digits and at most one ` +
-      `decimal point, nothing else, no currency symbols, no commas, no units, no trailing/leading zeros beyond ` +
-      `what's actually written. If you are not confident of the exact digits, use null rather than guessing — ` +
-      `never pad, repeat, or extend a number's digits under any circumstance. ` +
-      `"amount" is the TOTAL ₦ value written for that line — the number next to/after the item as a whole, already ` +
-      `covering all units on that line (e.g. "Baby Diaper 1pack ₦5000" → amount "5000"; "Indomie 3carton ₦23550" → ` +
-      `amount "23550", not divided by 3). Never compute or guess a per-unit price yourself — extract exactly the ` +
-      `total figure as written, and leave unit-price math to the app. ` +
-      `If a quantity or amount is unreadable or absent, use null. Do not guess values that aren't actually there. ` +
-      `If truly nothing on the page looks like an item line, respond with {"items": []}.`;
-
-    // Gemini's generateContent takes a flat "parts" array — text and inline
-    // image data side by side, order doesn't matter the way it can for Claude.
-    const parts = hasImage
-      ? [
-          { text: instructions },
-          { inline_data: { mime_type: mediaType || 'image/jpeg', data: imageBase64 } },
-        ]
-      : [
-          { text: `${instructions}\n\nHere is the pasted ledger text:\n\n${pastedText}` },
-        ];
-
-    // Pulls a rows array out of raw model text — strips markdown fences if
-    // present, then grabs the first [...] block from wherever it sits (the
-    // model occasionally adds a stray sentence before/after the JSON).
-    // Throws if nothing parseable is found; callers handle the repair pass.
-    function extractRowsFromText(rawText) {
-      const fenceStripped = rawText.replace(/```json\s*|```/g, '');
-      const arrayMatch = fenceStripped.match(/\[[\s\S]*\]/);
-      const cleaned = arrayMatch ? arrayMatch[0] : fenceStripped;
-      const parsed = JSON.parse(cleaned);
-      const rowsOut = Array.isArray(parsed) ? parsed : (parsed.items || parsed.rows || parsed.lines || []);
-      if (!Array.isArray(rowsOut)) throw new Error('not an array');
-      return rowsOut;
-    }
-
-    // One vendor's full attempt: call, parse, self-repair once if the raw
-    // output was malformed. Never throws — always returns a result object
-    // so both vendors can be run in parallel and compared afterward rather
-    // than one only kicking in once the other has already hard-failed.
-    async function tryGeminiExtraction() {
-      let modelUsed, finishReason, text;
+    // One vendor's full two-pass attempt: transcribe, then structure.
+    // Never throws — always returns a result object, so multiple vendors
+    // can be attempted and compared rather than one only kicking in once
+    // another has hard-failed.
+    async function runTwoPass(transcribeFn, vendorLabel) {
+      let rawText;
       try {
-        const aiRes = await callGeminiWithRetry({
-          systemInstruction: { role: 'system', parts: [{ text: RECEIPT_PARSER_SYSTEM_PROMPT }] },
-          contents: [{ role: 'user', parts }],
-          generationConfig: {
-            // Bumped further alongside dialing thinkingLevel back to
-            // 'medium' (see callGeminiWithRetry) — thinking tokens draw
-            // from this same budget, so more headroom here reduces the
-            // chance of truncation regardless of how much of it reasoning
-            // ends up using on a given page.
-            maxOutputTokens: 32768,
-            temperature: 0.1,
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: 'OBJECT',
-              properties: {
-                items: {
-                  type: 'ARRAY',
-                  items: {
-                    type: 'OBJECT',
-                    properties: {
-                      description: { type: 'STRING' },
-                      quantity: { type: 'STRING', nullable: true },
-                      amount: { type: 'STRING', nullable: true },
-                      category: { type: 'STRING', nullable: true },
-                      expiryDate: { type: 'STRING', nullable: true },
-                      batchNumber: { type: 'STRING', nullable: true },
-                    },
-                    required: ['description'],
-                  },
-                },
-              },
-              required: ['items'],
-            },
-          },
-        });
-        modelUsed = aiRes.modelUsed;
-        finishReason = aiRes.aiData.candidates?.[0]?.finishReason;
-        text = (aiRes.aiData.candidates?.[0]?.content?.parts || []).map((p) => p.text || '').join('').trim();
+        rawText = await transcribeFn();
       } catch (err) {
-        return { ok: false, vendor: 'gemini', error: err.message, transient: err.transient };
+        return { ok: false, vendor: vendorLabel, error: err.message, transient: err.transient };
+      }
+      if (!rawText || !rawText.trim()) {
+        return { ok: false, vendor: vendorLabel, error: 'Transcription came back empty' };
       }
       try {
-        return { ok: true, vendor: 'gemini', modelUsed, finishReason, rows: extractRowsFromText(text), text };
-      } catch (parseErr) {
-        try {
-          const repairedText = await repairMalformedJson(text);
-          return { ok: true, vendor: 'gemini', modelUsed, finishReason, rows: extractRowsFromText(repairedText), text };
-        } catch (repairErr) {
-          return { ok: false, vendor: 'gemini', modelUsed, finishReason, error: repairErr.message, rawText: text };
-        }
-      }
-    }
-
-    async function tryOpenAIExtraction() {
-      if (!process.env.OPENAI_API_KEY) return { ok: false, vendor: 'openai', error: 'OPENAI_API_KEY not configured' };
-      let text;
-      try {
-        text = await callOpenAIVisionFallback({ systemPrompt: RECEIPT_PARSER_SYSTEM_PROMPT, instructions, imageBase64, mediaType, pastedText });
+        const rowsOut = await structureTranscript(rawText, knownCategories, mode);
+        return { ok: true, vendor: vendorLabel, modelUsed: vendorLabel, rows: rowsOut, transcript: rawText };
       } catch (err) {
-        return { ok: false, vendor: 'openai', error: err.message };
-      }
-      try {
-        return { ok: true, vendor: 'openai', modelUsed: 'gpt-4o', rows: extractRowsFromText(text), text };
-      } catch (parseErr) {
-        try {
-          const repairedText = await repairMalformedJson(text);
-          return { ok: true, vendor: 'openai', modelUsed: 'gpt-4o', rows: extractRowsFromText(repairedText), text };
-        } catch (repairErr) {
-          return { ok: false, vendor: 'openai', modelUsed: 'gpt-4o', error: repairErr.message, rawText: text };
-        }
+        return { ok: false, vendor: vendorLabel, error: `structuring failed: ${err.message}`, transcript: rawText };
       }
     }
 
     let chosen;
     if (hasImage) {
-      // Run BOTH vendors on every photo and keep whichever result is
-      // actually more complete, rather than only reaching for OpenAI once
-      // Gemini hard-fails. This is the direct fix for the inconsistency
-      // seen in production: Gemini would return a clean, error-free
-      // response that nonetheless only captured 1 of 16 real lines — a
-      // fallback keyed on errors alone never catches a "successful but
-      // thin" result like that. Costs one extra vendor call per photo;
-      // worth it for a feature where silently dropping most of a day's
-      // sales is the failure mode being guarded against.
-      const [geminiResult, openaiResult] = await Promise.all([tryGeminiExtraction(), tryOpenAIExtraction()]);
-      const candidates = [geminiResult, openaiResult].filter((r) => r.ok);
-      if (candidates.length === 0) {
-        console.error('[ocr] both vendors failed — Gemini:', geminiResult.error, '| OpenAI:', openaiResult.error);
-        return res.status(geminiResult.transient ? 503 : 502).json({
-          error: geminiResult.transient
-            ? "Network busy — tap 'Parse entries' again in a few seconds."
-            : "Could not read the page — try a clearer photo, or tap 'Parse entries' again.",
-          debug: `Gemini: ${geminiResult.error} | OpenAI: ${openaiResult.error}`,
-        });
-      }
-      chosen = candidates.reduce((best, cur) => (cur.rows.length > best.rows.length ? cur : best));
-      console.log(`[ocr] gemini=${geminiResult.ok ? geminiResult.rows.length + ' rows' : 'failed'} openai=${openaiResult.ok ? openaiResult.rows.length + ' rows' : 'failed'} chose=${chosen.vendor}`);
-    } else {
-      // Pasted text isn't the flaky case this dual-vendor approach targets
-      // (it's typed/Lens-extracted text, not a messy photo) — keep this
-      // path simple and sequential: Gemini first, OpenAI only if Gemini
-      // truly fails, same as before.
-      const geminiResult = await tryGeminiExtraction();
-      if (geminiResult.ok) {
+      // Gemini first, alone — primary path while ANTHROPIC_API_KEY isn't
+      // funded yet (card declined on setup — see git history/conversation
+      // for context). Claude stays fully wired in as an escalation vendor:
+      // the moment billing is sorted, swapping the primary back is a
+      // one-line change (swap which vendor runs alone here vs. which two
+      // run in the escalation Promise.all below) — nothing else in the
+      // two-pass architecture needs to change either way.
+      const geminiResult = await runTwoPass(() => transcribeWithGemini(imageBase64, mediaType), 'gemini-flash-latest (2-pass)');
+      const isThin = (r) => !r.ok || r.rows.length <= 1;
+      if (!isThin(geminiResult)) {
         chosen = geminiResult;
+        console.log(`[ocr] gemini succeeded with ${geminiResult.rows.length} row(s) — no escalation needed`);
       } else {
-        const openaiResult = await tryOpenAIExtraction();
-        if (openaiResult.ok) {
-          chosen = openaiResult;
-        } else {
-          return res.status(geminiResult.transient ? 503 : 502).json({
-            error: geminiResult.transient
-              ? "Network busy — tap 'Parse entries' again in a few seconds."
-              : 'Could not parse the pasted text — check it copied over correctly',
-            debug: `Gemini: ${geminiResult.error} | OpenAI: ${openaiResult.error}`,
+        // Gemini failed outright, or came back suspiciously thin (<=1 row
+        // -- the exact symptom that motivated this rebuild). Escalate to
+        // both remaining vendors in parallel and keep whichever of all
+        // three attempts is actually most complete. Claude will simply
+        // fail fast here (no ANTHROPIC_API_KEY) and contribute nothing —
+        // harmless, not an error state for the request as a whole.
+        console.warn(`[ocr] Gemini ${geminiResult.ok ? `only found ${geminiResult.rows.length} row(s)` : `failed: ${geminiResult.error}`} — escalating to Claude + OpenAI (2-pass, parallel)`);
+        const [claudeResult, openaiResult] = await Promise.all([
+          runTwoPass(() => transcribeWithClaude(imageBase64, mediaType), 'claude-sonnet-5 (2-pass)'),
+          runTwoPass(() => transcribeWithOpenAI(imageBase64, mediaType), 'gpt-4o (2-pass)'),
+        ]);
+        const candidates = [geminiResult, claudeResult, openaiResult].filter((r) => r.ok);
+        if (candidates.length === 0) {
+          console.error('[ocr] all three vendors failed — Gemini:', geminiResult.error, '| Claude:', claudeResult.error, '| OpenAI:', openaiResult.error);
+          return res.status(502).json({
+            error: "Could not read the page — try a clearer photo, or tap 'Parse entries' again.",
+            debug: `Gemini: ${geminiResult.error} | Claude: ${claudeResult.error} | OpenAI: ${openaiResult.error}`,
           });
         }
+        chosen = candidates.reduce((best, cur) => (cur.rows.length > best.rows.length ? cur : best));
+        console.log(`[ocr] gemini=${geminiResult.ok ? geminiResult.rows.length + ' rows' : 'failed'} claude=${claudeResult.ok ? claudeResult.rows.length + ' rows' : 'failed'} openai=${openaiResult.ok ? openaiResult.rows.length + ' rows' : 'failed'} chose=${chosen.vendor}`);
+      }
+    } else {
+      // Pasted text is already "transcribed" (typed or Google-Lens-
+      // extracted) — skip the vision step entirely and go straight to
+      // structuring.
+      try {
+        const rowsOut = await structureTranscript(pastedText, knownCategories, mode);
+        chosen = { vendor: 'gemini-flash-latest (structuring only)', modelUsed: 'gemini-flash-latest (structuring only)', rows: rowsOut };
+      } catch (err) {
+        console.error('[ocr] pasted-text structuring failed:', err.message);
+        return res.status(502).json({
+          error: 'Could not parse the pasted text — check it copied over correctly',
+          debug: err.message,
+        });
       }
     }
 
@@ -2360,7 +2405,6 @@ app.post('/ocr/parse-page', requireAuth, ocrRateLimit, async (req, res) => {
     const modelUsed = chosen.modelUsed;
 
     const inventory = (await pool.query('SELECT * FROM inventory_items WHERE business_id = $1', [req.user.businessId])).rows;
-
     const reviewed = rows.map((row) => {
       const match = fuzzyMatchItem(row.description, inventory);
       // Both parsed defensively — see safeParsedNumber() above. A row whose
