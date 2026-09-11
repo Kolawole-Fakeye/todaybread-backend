@@ -1993,7 +1993,7 @@ const RECEIPT_PARSER_SYSTEM_PROMPT =
 const GEMINI_MODEL_CHAIN = ['gemini-flash-latest', 'gemini-flash-lite-latest'];
 const GEMINI_RETRY_DELAYS_MS = [1000, 2000, 4000]; // 1s, 2s, 4s between attempts
 
-async function callGeminiWithRetry(baseRequestBody) {
+async function callGeminiWithRetry(baseRequestBody, thinkingLevelOverride = 'medium') {
   let lastErr;
   for (let modelIdx = 0; modelIdx < GEMINI_MODEL_CHAIN.length; modelIdx++) {
     const model = GEMINI_MODEL_CHAIN[modelIdx];
@@ -2010,18 +2010,19 @@ async function callGeminiWithRetry(baseRequestBody) {
     // spending more of that budget on reasoning about a dense page left
     // too little room to write out the full result, reintroducing
     // MAX_TOKENS truncation — just via a different mechanism than the
-    // original runaway-digit bug. 'medium' is the middle ground, paired
-    // with a larger maxOutputTokens ceiling (see below) and, more
-    // importantly, no longer trusted alone: /ocr/parse-page now runs
-    // Gemini and OpenAI in parallel on every photo and keeps whichever
-    // result is actually more complete, rather than tuning one vendor's
-    // single knob forever. The fallback is a Flash-Lite tier, which
-    // doesn't think by default — no config there.
+    // original runaway-digit bug. 'medium' is the default middle ground.
+    // Callers can override per-call (e.g. the fast single-pass attempt
+    // uses 'low' deliberately, trading some reasoning depth for speed on
+    // the assumption that a thin result just falls through to the proven,
+    // slower two-pass chain anyway — so the downside of undershooting here
+    // is bounded, not a dead end the way it was before that chain existed).
+    // The fallback is a Flash-Lite tier, which doesn't think by default —
+    // no config there.
     const requestBody = {
       ...baseRequestBody,
       generationConfig: {
         ...baseRequestBody.generationConfig,
-        ...(modelIdx === 0 ? { thinkingConfig: { thinkingLevel: 'medium' } } : {}),
+        ...(modelIdx === 0 ? { thinkingConfig: { thinkingLevel: thinkingLevelOverride } } : {}),
       },
     };
     // Primary model gets the full retry budget (1 initial + 3 retries).
@@ -2294,6 +2295,61 @@ async function repairMalformedJson(rawText) {
   return (aiData.candidates?.[0]?.content?.parts || []).map((p) => p.text || '').join('').trim();
 }
 
+// Fast single-pass attempt — combines transcription and structuring into
+// ONE call instead of two, using the same safe schema (STRING, not NUMBER,
+// for quantity/amount — the type that caused the original runaway-digit
+// crash) and 'low' thinking for speed. This is what gets a clean, simple
+// photo close to real chat-like speed: one round trip, not the full
+// two-pass chain. If it comes back thin (<=1 row) or fails outright, the
+// caller falls through to the proven two-pass chain — the downside of
+// 'low' thinking undershooting on a hard page is bounded now, since it's
+// no longer the only attempt the way it was before that chain existed.
+// Deliberately skips the repair-on-malformed-JSON pass other paths use —
+// speed is the point here, so a malformed fast result is just treated as
+// thin and handed off to the slower, more careful chain instead of trying
+// to salvage it.
+async function fastSinglePassGemini(imageBase64, mediaType, knownCategories, mode) {
+  const instructions = buildStructuringInstructions(knownCategories, mode);
+  const aiRes = await callGeminiWithRetry({
+    systemInstruction: { role: 'system', parts: [{ text: RECEIPT_PARSER_SYSTEM_PROMPT }] },
+    contents: [{
+      role: 'user',
+      parts: [
+        { text: `${instructions}\n\nRead the ledger directly from the attached photo.` },
+        { inline_data: { mime_type: mediaType || 'image/jpeg', data: imageBase64 } },
+      ],
+    }],
+    generationConfig: {
+      maxOutputTokens: 16384,
+      temperature: 0.1,
+      responseMimeType: 'application/json',
+      responseSchema: {
+        type: 'OBJECT',
+        properties: {
+          items: {
+            type: 'ARRAY',
+            items: {
+              type: 'OBJECT',
+              properties: {
+                description: { type: 'STRING' },
+                quantity: { type: 'STRING', nullable: true },
+                amount: { type: 'STRING', nullable: true },
+                category: { type: 'STRING', nullable: true },
+                expiryDate: { type: 'STRING', nullable: true },
+                batchNumber: { type: 'STRING', nullable: true },
+              },
+              required: ['description'],
+            },
+          },
+        },
+        required: ['items'],
+      },
+    },
+  }, 'low');
+  const text = (aiRes.aiData.candidates?.[0]?.content?.parts || []).map((p) => p.text || '').join('').trim();
+  return extractRowsFromText(text); // throws on malformed output — caller treats that as "thin", same as an empty/short result
+}
+
 app.post('/ocr/parse-page', requireAuth, ocrRateLimit, async (req, res) => {
   const { imageBase64, mediaType, text: pastedText, mode } = req.body;
   const hasImage = !!imageBase64;
@@ -2350,6 +2406,28 @@ app.post('/ocr/parse-page', requireAuth, ocrRateLimit, async (req, res) => {
 
     let chosen;
     if (hasImage) {
+      // Fast path first: one cheap, single-pass attempt aimed at real
+      // chat-like speed on the common case (a clear, reasonably simple
+      // photo). Only trusted if it comes back with more than 1 row —
+      // anything thinner falls straight through to the proven, slower
+      // Gemini-two-pass-then-escalate chain below, same as if this
+      // attempt had never been made.
+      let fastResult = null;
+      try {
+        const fastRows = await fastSinglePassGemini(imageBase64, mediaType, knownCategories, mode);
+        if (fastRows.length > 1) {
+          fastResult = { ok: true, vendor: 'gemini-flash-latest (fast single-pass)', modelUsed: 'gemini-flash-latest (fast single-pass)', rows: fastRows };
+          console.log(`[ocr] fast single-pass succeeded with ${fastRows.length} row(s) — skipping two-pass chain entirely`);
+        } else {
+          console.warn(`[ocr] fast single-pass thin (${fastRows.length} row(s)) — falling through to two-pass chain`);
+        }
+      } catch (err) {
+        console.warn('[ocr] fast single-pass failed, falling through to two-pass chain:', err.message);
+      }
+
+      if (fastResult) {
+        chosen = fastResult;
+      } else {
       // Gemini first, alone — primary path while ANTHROPIC_API_KEY isn't
       // funded yet (card declined on setup — see git history/conversation
       // for context). Claude stays fully wired in as an escalation vendor:
@@ -2385,6 +2463,7 @@ app.post('/ocr/parse-page', requireAuth, ocrRateLimit, async (req, res) => {
         chosen = candidates.reduce((best, cur) => (cur.rows.length > best.rows.length ? cur : best));
         console.log(`[ocr] gemini=${geminiResult.ok ? geminiResult.rows.length + ' rows' : 'failed'} claude=${claudeResult.ok ? claudeResult.rows.length + ' rows' : 'failed'} openai=${openaiResult.ok ? openaiResult.rows.length + ' rows' : 'failed'} chose=${chosen.vendor}`);
       }
+      } // closes: if (fastResult) { ... } else { <gemini two-pass + escalation> }
     } else {
       // Pasted text is already "transcribed" (typed or Google-Lens-
       // extracted) — skip the vision step entirely and go straight to
