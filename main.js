@@ -1134,6 +1134,37 @@ app.post('/reports/quarterly-opt-in', requireAuth, requireOwner, async (req, res
   }
 });
 
+// POST /reports/email-now — owner-triggered, send-it-right-now version of
+// the same report used for the 90-day automatic email (buildQuarterlyReportHtml).
+// Replaces "Print" as the practical way to get insights out of the app —
+// printers are rarely actually connected day-to-day for a small trader,
+// while an email always works. Falls back to whatever email is already on
+// file (from quarterly-report opt-in) if the request doesn't supply one,
+// and saves a newly-typed email for next time, mirroring how the
+// quarterly opt-in flow already behaves.
+app.post('/reports/email-now', requireAuth, requireOwner, async (req, res) => {
+  try {
+    const bodyEmail = (req.body?.email || '').trim();
+    let targetEmail = bodyEmail;
+    if (!targetEmail) {
+      const userRow = (await pool.query('SELECT email FROM users WHERE id = $1', [req.user.userId])).rows[0];
+      targetEmail = userRow?.email || '';
+    }
+    if (!targetEmail || !targetEmail.includes('@')) {
+      return res.status(400).json({ error: 'No email on file yet — enter an email address to send this report to.' });
+    }
+    const bizRow = (await pool.query('SELECT id, name FROM businesses WHERE id = $1', [req.user.businessId])).rows[0];
+    if (!bizRow) return res.status(404).json({ error: 'Business not found' });
+    const html = await buildQuarterlyReportHtml(bizRow, targetEmail);
+    await sendEmail(targetEmail, `Your TodayBread Report — ${bizRow.name}`, html);
+    if (bodyEmail) await pool.query('UPDATE users SET email = $1 WHERE id = $2', [bodyEmail, req.user.userId]);
+    res.json({ sent: true, email: targetEmail });
+  } catch (err) {
+    console.error('[/reports/email-now] error:', err.message);
+    res.status(500).json({ error: 'Could not send the report email' });
+  }
+});
+
 // POST /settings/whatsapp — owner turns TodayBread's outbound WhatsApp
 // messages (welcome message, daily summary) on or off for privacy. This
 // never touches the number itself — just whether TodayBread sends to it.
@@ -2092,17 +2123,27 @@ const TRANSCRIBE_INSTRUCTIONS =
   `illegible, write [illegible] in its place rather than guessing at it. Do not add commentary, headers, page ` +
   `numbers, or explanation — output only the transcribed lines themselves, nothing else.`;
 
-// Pulls a rows array out of raw model text — strips markdown fences if
-// present, then grabs the first [...] block from wherever it sits (models
-// occasionally add a stray sentence before/after the JSON).
+// Pulls a rows array (and, if present, a top-level ledgerDate) out of raw
+// model text — strips markdown fences if present, then grabs the first
+// {...} or [...] block from wherever it sits (models occasionally add a
+// stray sentence before/after the JSON). Returns { rows, ledgerDate } —
+// ledgerDate is null whenever the model didn't find one or the response
+// was a bare array (older shape, no date field to find).
 function extractRowsFromText(rawText) {
   const fenceStripped = rawText.replace(/```json\s*|```/g, '');
+  const objectMatch = fenceStripped.match(/\{[\s\S]*\}/);
   const arrayMatch = fenceStripped.match(/\[[\s\S]*\]/);
-  const cleaned = arrayMatch ? arrayMatch[0] : fenceStripped;
+  // Prefer the object match when present (it's the expected shape now,
+  // {"items": [...], "ledgerDate": ...}) — only fall back to a bare array
+  // match if there's genuinely no object wrapper in the response at all.
+  const cleaned = objectMatch ? objectMatch[0] : (arrayMatch ? arrayMatch[0] : fenceStripped);
   const parsed = JSON.parse(cleaned);
   const rowsOut = Array.isArray(parsed) ? parsed : (parsed.items || parsed.rows || parsed.lines || []);
   if (!Array.isArray(rowsOut)) throw new Error('not an array');
-  return rowsOut;
+  const ledgerDate = (!Array.isArray(parsed) && typeof parsed.ledgerDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(parsed.ledgerDate))
+    ? parsed.ledgerDate
+    : null;
+  return { rows: rowsOut, ledgerDate };
 }
 
 // Primary vision reader. Model string per Anthropic's current lineup —
@@ -2218,22 +2259,27 @@ function buildStructuringInstructions(knownCategories, mode) {
     `directly as text). Turn it into structured rows. Different businesses lay this out differently (item then ` +
     `price, qty x item @unit price, shorthand abbreviations, etc.) — read whatever structure is actually there. ` +
     `${quantityHint} ${expiryHint} Extract every line item present — do not skip or truncate any of them. ${categoryHint} ` +
+    `Separately, if a date for this whole page/ledger entry is visible anywhere (a header date on a printed ` +
+    `receipt, a date handwritten at the top of a notebook page, etc.), put it in the top-level "ledgerDate" field ` +
+    `as strict YYYY-MM-DD — this is the date the PAGE itself is dated, not any per-item expiry date. If no such ` +
+    `date is present or determinable, use null rather than guessing one. ` +
     `Respond with ONLY the structured JSON — no explanation, no markdown code fences, no commentary. In this exact shape: ` +
-    `{"items": [{"description": "...", "quantity": number, "amount": number_or_null, "category": string_or_null, "expiryDate": string_or_null, "batchNumber": string_or_null}]}. ` +
+    `{"items": [{"description": "...", "quantity": number, "amount": number_or_null, "category": string_or_null, "expiryDate": string_or_null, "batchNumber": string_or_null}], "ledgerDate": string_or_null}. ` +
     `"quantity" and "amount" must be plain numeric strings ONLY (e.g. "3", "23550") — digits and at most one ` +
     `decimal point, nothing else, no currency symbols, no commas, no units. If you are not confident of the exact ` +
     `digits, use null rather than guessing — never pad, repeat, or extend a number's digits under any circumstance. ` +
     `"amount" is the TOTAL ₦ value written for that line, already covering all units on that line (e.g. "Baby ` +
     `Diaper 1pack ₦5000" → amount "5000"; "Indomie 3carton ₦23550" → amount "23550", not divided by 3). Never ` +
     `compute or guess a per-unit price yourself. If a quantity or amount is unreadable or absent, use null. ` +
-    `If truly nothing looks like an item line, respond with {"items": []}.`
+    `If truly nothing looks like an item line, respond with {"items": [], "ledgerDate": null}.`
   );
 }
 
 // The shared pass-2 call — deliberately Gemini, text-only, since this step
 // no longer needs vision at all, just reliable reformatting of text that's
 // already known to be accurate. Self-repairs once via repairMalformedJson
-// on a malformed response, same pattern as before.
+// on a malformed response, same pattern as before. Returns { rows,
+// ledgerDate }.
 async function structureTranscript(rawTranscript, knownCategories, mode) {
   const instructions = buildStructuringInstructions(knownCategories, mode);
   const aiRes = await callGeminiWithRetry({
@@ -2245,6 +2291,7 @@ async function structureTranscript(rawTranscript, knownCategories, mode) {
       responseSchema: {
         type: 'OBJECT',
         properties: {
+          ledgerDate: { type: 'STRING', nullable: true },
           items: {
             type: 'ARRAY',
             items: {
@@ -2326,6 +2373,7 @@ async function fastSinglePassGemini(imageBase64, mediaType, knownCategories, mod
       responseSchema: {
         type: 'OBJECT',
         properties: {
+          ledgerDate: { type: 'STRING', nullable: true },
           items: {
             type: 'ARRAY',
             items: {
@@ -2347,7 +2395,7 @@ async function fastSinglePassGemini(imageBase64, mediaType, knownCategories, mod
     },
   }, 'low');
   const text = (aiRes.aiData.candidates?.[0]?.content?.parts || []).map((p) => p.text || '').join('').trim();
-  return extractRowsFromText(text); // throws on malformed output — caller treats that as "thin", same as an empty/short result
+  return extractRowsFromText(text); // { rows, ledgerDate } — throws on malformed output; caller treats that as "thin", same as an empty/short result
 }
 
 app.post('/ocr/parse-page', requireAuth, ocrRateLimit, async (req, res) => {
@@ -2397,8 +2445,8 @@ app.post('/ocr/parse-page', requireAuth, ocrRateLimit, async (req, res) => {
         return { ok: false, vendor: vendorLabel, error: 'Transcription came back empty' };
       }
       try {
-        const rowsOut = await structureTranscript(rawText, knownCategories, mode);
-        return { ok: true, vendor: vendorLabel, modelUsed: vendorLabel, rows: rowsOut, transcript: rawText };
+        const { rows: rowsOut, ledgerDate } = await structureTranscript(rawText, knownCategories, mode);
+        return { ok: true, vendor: vendorLabel, modelUsed: vendorLabel, rows: rowsOut, ledgerDate, transcript: rawText };
       } catch (err) {
         return { ok: false, vendor: vendorLabel, error: `structuring failed: ${err.message}`, transcript: rawText };
       }
@@ -2414,9 +2462,9 @@ app.post('/ocr/parse-page', requireAuth, ocrRateLimit, async (req, res) => {
       // attempt had never been made.
       let fastResult = null;
       try {
-        const fastRows = await fastSinglePassGemini(imageBase64, mediaType, knownCategories, mode);
+        const { rows: fastRows, ledgerDate: fastLedgerDate } = await fastSinglePassGemini(imageBase64, mediaType, knownCategories, mode);
         if (fastRows.length > 1) {
-          fastResult = { ok: true, vendor: 'gemini-flash-latest (fast single-pass)', modelUsed: 'gemini-flash-latest (fast single-pass)', rows: fastRows };
+          fastResult = { ok: true, vendor: 'gemini-flash-latest (fast single-pass)', modelUsed: 'gemini-flash-latest (fast single-pass)', rows: fastRows, ledgerDate: fastLedgerDate };
           console.log(`[ocr] fast single-pass succeeded with ${fastRows.length} row(s) — skipping two-pass chain entirely`);
         } else {
           console.warn(`[ocr] fast single-pass thin (${fastRows.length} row(s)) — falling through to two-pass chain`);
@@ -2469,8 +2517,8 @@ app.post('/ocr/parse-page', requireAuth, ocrRateLimit, async (req, res) => {
       // extracted) — skip the vision step entirely and go straight to
       // structuring.
       try {
-        const rowsOut = await structureTranscript(pastedText, knownCategories, mode);
-        chosen = { vendor: 'gemini-flash-latest (structuring only)', modelUsed: 'gemini-flash-latest (structuring only)', rows: rowsOut };
+        const { rows: rowsOut, ledgerDate } = await structureTranscript(pastedText, knownCategories, mode);
+        chosen = { vendor: 'gemini-flash-latest (structuring only)', modelUsed: 'gemini-flash-latest (structuring only)', rows: rowsOut, ledgerDate };
       } catch (err) {
         console.error('[ocr] pasted-text structuring failed:', err.message);
         return res.status(502).json({
@@ -2482,6 +2530,17 @@ app.post('/ocr/parse-page', requireAuth, ocrRateLimit, async (req, res) => {
 
     const rows = chosen.rows;
     const modelUsed = chosen.modelUsed;
+    const ledgerDate = chosen.ledgerDate || null;
+
+    // Price-mismatch threshold — anything closer than this is treated as
+    // OCR/rounding noise on the extracted digits, not a real price change.
+    // A genuine price increase from a supplier is normally a much bigger
+    // jump than reading "5,000" as "5,500" would ever produce by accident.
+    // Only checked in Recording Sales mode, against this item's actual
+    // sale_price — Stock Arrival's per-line amount is a cost, not a sale
+    // price, and is handled separately by receive-stock's own weighted-
+    // average logic.
+    const PRICE_MISMATCH_THRESHOLD = 0.10;
 
     const inventory = (await pool.query('SELECT * FROM inventory_items WHERE business_id = $1', [req.user.businessId])).rows;
     const reviewed = rows.map((row) => {
@@ -2497,6 +2556,17 @@ app.post('/ocr/parse-page', requireAuth, ocrRateLimit, async (req, res) => {
       // for — protects the frontend's <input type="date"> from receiving
       // something malformed if the model didn't follow instructions exactly.
       const validExpiry = row.expiryDate && /^\d{4}-\d{2}-\d{2}$/.test(row.expiryDate) ? row.expiryDate : null;
+      // The receipt's own implied unit price (line total / qty) vs. what's
+      // actually on file for this item — flagged for the trader to notice
+      // and resolve, never auto-applied and never blocking the sale.
+      let priceMismatch = null;
+      if (mode !== 'stock' && match && parsedAmount && qty > 0 && unitPrice > 0) {
+        const extractedUnitPrice = parsedAmount / qty;
+        const diffRatio = Math.abs(extractedUnitPrice - unitPrice) / unitPrice;
+        if (diffRatio > PRICE_MISMATCH_THRESHOLD) {
+          priceMismatch = { recordedPrice: unitPrice, extractedUnitPrice: Math.round(extractedUnitPrice) };
+        }
+      }
       return {
         rawDescription: row.description,
         quantity: qty,
@@ -2507,11 +2577,12 @@ app.post('/ocr/parse-page', requireAuth, ocrRateLimit, async (req, res) => {
         matchedItem: match ? { id: match.item.id, name: match.item.name, confidence: Number(match.confidence.toFixed(2)) } : null,
         suggestedTotal: unitPrice ? unitPrice * qty : parsedAmount,
         needsReview: !match || match.confidence < 0.6,
+        priceMismatch,
       };
     });
 
     const totalFromPage = reviewed.reduce((s, r) => s + (r.suggestedTotal || 0), 0);
-    res.json({ rows: reviewed, totalFromPage, rowCount: reviewed.length, modelUsed });
+    res.json({ rows: reviewed, totalFromPage, rowCount: reviewed.length, modelUsed, ledgerDate });
   } catch (err) {
     console.error('[ocr] error:', err);
     res.status(500).json({ error: 'Could not process the ledger entry', debug: err.message });
