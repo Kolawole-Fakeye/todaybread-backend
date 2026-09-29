@@ -287,10 +287,46 @@ CREATE TABLE IF NOT EXISTS audit_log (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Snapshot audit trail: one row per scanned page. No photo is stored (kept
+-- out for now, no bucket configured) — raw_text is the record of what the
+-- scan actually read, and sales.scan_id below links each recorded sale back
+-- to the page that produced it.
+CREATE TABLE IF NOT EXISTS scans (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  business_id UUID NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+  staff_user_id UUID NOT NULL REFERENCES users(id),
+  scan_type TEXT NOT NULL CHECK (scan_type IN ('sale', 'stock_arrival')),
+  ledger_date DATE NOT NULL,
+  raw_text TEXT,
+  parsed_via TEXT,
+  page_total NUMERIC(12,2),
+  -- Generated once on the client when the flat page opens, and resent as-is
+  -- on any retry (bad network, double-tap on "Save"). Lets /ocr/commit tell
+  -- "this exact scan already went through" apart from "this is a new scan",
+  -- which a fresh server-generated scan id per request could never do.
+  client_scan_id UUID,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (business_id, client_scan_id)
+);
+
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS scan_id UUID REFERENCES scans(id) ON DELETE SET NULL;
+
+-- Remembered name aliases — once an owner confirms a fuzzy/unmatched
+-- Snapshot line really is item X, that exact wording is saved here so the
+-- next scan matches instantly instead of falling into review again.
+CREATE TABLE IF NOT EXISTS item_aliases (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  business_id UUID NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+  item_id UUID NOT NULL REFERENCES inventory_items(id) ON DELETE CASCADE,
+  alias_text TEXT NOT NULL,
+  UNIQUE (business_id, alias_text)
+);
+
 CREATE INDEX IF NOT EXISTS idx_sales_business_time ON sales (business_id, occurred_at);
 CREATE INDEX IF NOT EXISTS idx_inventory_business ON inventory_items (business_id);
 CREATE INDEX IF NOT EXISTS idx_users_business ON users (business_id);
 CREATE INDEX IF NOT EXISTS idx_audit_business_time ON audit_log (business_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_scans_business_time ON scans (business_id, created_at);
 `;
 
 async function migrate() {
@@ -711,7 +747,14 @@ function makeRateLimiter({ windowMs, max }) {
 // 10 photo/text parses per 5 minutes per business — generous for genuine
 // end-of-day batch scanning, tight enough to stop a runaway loop from
 // quietly burning through both AI vendors' budgets.
-const ocrRateLimit = makeRateLimiter({ windowMs: 5 * 60 * 1000, max: 10 })((req) => `ocr:${req.user?.businessId || req.ip}`);
+// 30 photo/text parses per 5 minutes per business — loosened from an
+// original 10 after a live client demo tripped it: retaking a photo and
+// re-parsing several times in a few minutes is completely normal demo/
+// real-world behavior, especially with the two-pass escalation chain
+// sometimes firing multiple vendor calls per attempt. Still a real ceiling
+// against a genuine runaway loop, just not one a normal demo session
+// should ever brush up against.
+const ocrRateLimit = makeRateLimiter({ windowMs: 5 * 60 * 1000, max: 30 })((req) => `ocr:${req.user?.businessId || req.ip}`);
 // Signup/forgot-pin are unauthenticated — keyed by IP instead of businessId.
 const signupRateLimit = makeRateLimiter({ windowMs: 60 * 60 * 1000, max: 5 })((req) => `signup:${req.ip}`);
 const forgotPinRateLimit = makeRateLimiter({ windowMs: 60 * 60 * 1000, max: 5 })((req) => `forgot-pin:${req.ip}`);
@@ -1719,17 +1762,23 @@ app.patch('/inventory/:id/receive-stock', requireAuth, requireOwner, async (req,
 // deducting normally, controlled by deductStock, and can go negative if
 // genuinely oversold relative to a real starting count — that's a
 // legitimate signal there, not a display bug.
-async function recordSale(client, businessId, staffUserId, { itemId, qty, paymentMethod, clientUuid, occurredAt, deductStock }) {
+async function recordSale(client, businessId, staffUserId, { itemId, qty, paymentMethod, clientUuid, occurredAt, deductStock, unitPrice, scanId }) {
   const itemResult = await client.query('SELECT * FROM inventory_items WHERE id = $1 AND business_id = $2 FOR UPDATE', [itemId, businessId]);
   const item = itemResult.rows[0];
   if (!item) return { error: 'Item not found', status: 404 };
 
   const shouldDeductStock = deductStock !== false && item.stock_tracked !== false;
+  // unitPrice lets a Snapshot commit save the exact page amount (÷ qty) as
+  // what the sale is recorded at, instead of always trusting the catalogue
+  // sale_price — a discounted sale in the book is saved at what was
+  // actually charged. /sales and /sales/sync never pass this, so they're
+  // unaffected and keep using item.sale_price exactly as before.
+  const finalUnitPrice = unitPrice != null ? unitPrice : item.sale_price;
 
   const saleResult = await client.query(
-    `INSERT INTO sales (business_id, item_id, staff_user_id, qty, unit_price, unit_cost, payment_method, client_uuid, occurred_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (business_id, client_uuid) DO NOTHING RETURNING *`,
-    [businessId, itemId, staffUserId, qty, item.sale_price, item.cost_price, paymentMethod, clientUuid, occurredAt || new Date()]
+    `INSERT INTO sales (business_id, item_id, staff_user_id, qty, unit_price, unit_cost, payment_method, client_uuid, occurred_at, scan_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (business_id, client_uuid) DO NOTHING RETURNING *`,
+    [businessId, itemId, staffUserId, qty, finalUnitPrice, item.cost_price, paymentMethod, clientUuid, occurredAt || new Date(), scanId || null]
   );
   if (saleResult.rows.length === 0) return { duplicate: true, item };
 
@@ -1974,8 +2023,26 @@ function safeParsedNumber(raw, { max = 1e7 } = {}) {
 // the caller decides what to do with a low-confidence result. A floor below
 // 0.12 is filtered out entirely since that's indistinguishable from noise
 // (e.g. matching on one common short word by coincidence).
-function fuzzyMatchItem(description, inventory) {
-  const target = normalize(description).split(' ').filter(Boolean);
+// Now async: checks item_aliases (a name the owner has previously confirmed
+// for this exact business) before falling back to word-overlap scoring.
+// An alias hit is treated as certain — no scoring needed — which is what
+// makes a repeat misspelled/shorthand name match instantly on later scans
+// instead of landing in "needs review" every single time.
+async function fuzzyMatchItem(description, inventory, businessId, pool) {
+  const normalizedDesc = normalize(description);
+
+  const aliasRow = await pool.query(
+    `SELECT ia.item_id, i.* FROM item_aliases ia
+     JOIN inventory_items i ON i.id = ia.item_id
+     WHERE ia.business_id = $1 AND ia.alias_text = $2`,
+    [businessId, normalizedDesc]
+  );
+  if (aliasRow.rows.length > 0) {
+    const { item_id, ...item } = aliasRow.rows[0];
+    return { item, confidence: 1, viaAlias: true };
+  }
+
+  const target = normalizedDesc.split(' ').filter(Boolean);
   if (target.length === 0 || inventory.length === 0) return null;
   let best = null, bestScore = 0;
   for (const item of inventory) {
@@ -2398,25 +2465,122 @@ async function fastSinglePassGemini(imageBase64, mediaType, knownCategories, mod
   return extractRowsFromText(text); // { rows, ledgerDate } — throws on malformed output; caller treats that as "thin", same as an empty/short result
 }
 
-app.post('/ocr/parse-page', requireAuth, ocrRateLimit, async (req, res) => {
+// STAGE 1 — raw extraction only. Powers the flat editable "looks like the
+// real notebook page" screen that opens immediately after a photo is taken.
+// No inventory matching, no category/expiry inference here — those are
+// stage 2's job, run once against what the owner actually confirmed rather
+// than the raw scan. Never returns an error status for an extraction
+// failure — the flat page still opens (empty, or with what little came
+// back), so the owner can type the rest by hand on bad network instead of
+// being blocked entirely.
+app.post('/ocr/transcribe', requireAuth, ocrRateLimit, async (req, res) => {
   const { imageBase64, mediaType, text: pastedText, mode } = req.body;
   const hasImage = !!imageBase64;
   const hasText = !!(pastedText && pastedText.trim());
   if (!hasImage && !hasText) {
-    return res.status(400).json({ error: 'Provide either imageBase64 (photo) or text (pasted ledger text)' });
+    return res.status(400).json({ error: 'Provide either imageBase64 (photo) or text (typed lines)' });
   }
-  const MAX_PASTE_CHARS = 8000; // generous for a full day's ledger, cheap guard against runaway pastes
+  const MAX_PASTE_CHARS = 8000;
   if (hasText && pastedText.length > MAX_PASTE_CHARS) {
-    return res.status(400).json({ error: `Pasted text is too long (${pastedText.length} characters, max ${MAX_PASTE_CHARS}) — split it into smaller batches` });
+    return res.status(400).json({ error: `Text is too long (${pastedText.length} characters, max ${MAX_PASTE_CHARS})` });
   }
   if (!process.env.GEMINI_API_KEY) {
     return res.status(500).json({ error: 'GEMINI_API_KEY is not configured on the server' });
   }
 
   try {
-    // Grounds the category suggestion in categories this business actually
-    // uses (seeded + custom-added) rather than letting the model invent its
-    // own taxonomy — same union query as GET /inventory/categories.
+    async function runTwoPass(transcribeFn, vendorLabel) {
+      let rawText;
+      try {
+        rawText = await transcribeFn();
+      } catch (err) {
+        return { ok: false, vendor: vendorLabel, error: err.message, transient: err.transient };
+      }
+      if (!rawText || !rawText.trim()) {
+        return { ok: false, vendor: vendorLabel, error: 'Transcription came back empty' };
+      }
+      try {
+        // knownCategories deliberately [] here — category suggestion moved
+        // to stage 2 (parse-page), run against the edited rows instead.
+        const { rows: rowsOut, ledgerDate } = await structureTranscript(rawText, [], mode);
+        return { ok: true, vendor: vendorLabel, modelUsed: vendorLabel, rows: rowsOut, ledgerDate, transcript: rawText };
+      } catch (err) {
+        return { ok: false, vendor: vendorLabel, error: `structuring failed: ${err.message}`, transcript: rawText };
+      }
+    }
+
+    let chosen;
+    if (hasImage) {
+      let fastResult = null;
+      try {
+        const { rows: fastRows, ledgerDate: fastLedgerDate } = await fastSinglePassGemini(imageBase64, mediaType, [], mode);
+        if (fastRows.length > 1) {
+          fastResult = { ok: true, vendor: 'gemini-flash-latest (fast single-pass)', modelUsed: 'gemini-flash-latest (fast single-pass)', rows: fastRows, ledgerDate: fastLedgerDate };
+          console.log(`[ocr/transcribe] fast single-pass succeeded with ${fastRows.length} row(s)`);
+        } else {
+          console.warn(`[ocr/transcribe] fast single-pass thin (${fastRows.length} row(s)) — falling through to two-pass chain`);
+        }
+      } catch (err) {
+        console.warn('[ocr/transcribe] fast single-pass failed, falling through:', err.message);
+      }
+
+      if (fastResult) {
+        chosen = fastResult;
+      } else {
+        const geminiResult = await runTwoPass(() => transcribeWithGemini(imageBase64, mediaType), 'gemini-flash-latest (2-pass)');
+        const isThin = (r) => !r.ok || r.rows.length <= 1;
+        if (!isThin(geminiResult)) {
+          chosen = geminiResult;
+          console.log(`[ocr/transcribe] gemini succeeded with ${geminiResult.rows.length} row(s) — no escalation needed`);
+        } else {
+          console.warn(`[ocr/transcribe] Gemini ${geminiResult.ok ? `only found ${geminiResult.rows.length} row(s)` : `failed: ${geminiResult.error}`} — escalating to Claude + OpenAI (2-pass, parallel)`);
+          const [claudeResult, openaiResult] = await Promise.all([
+            runTwoPass(() => transcribeWithClaude(imageBase64, mediaType), 'claude-sonnet-5 (2-pass)'),
+            runTwoPass(() => transcribeWithOpenAI(imageBase64, mediaType), 'gpt-4o (2-pass)'),
+          ]);
+          const candidates = [geminiResult, claudeResult, openaiResult].filter((r) => r.ok);
+          if (candidates.length === 0) {
+            console.error('[ocr/transcribe] all three vendors failed — Gemini:', geminiResult.error, '| Claude:', claudeResult.error, '| OpenAI:', openaiResult.error);
+            return res.json({ rows: [], ledgerDate: null, modelUsed: null, extractionFailed: true });
+          }
+          chosen = candidates.reduce((best, cur) => (cur.rows.length > best.rows.length ? cur : best));
+          console.log(`[ocr/transcribe] gemini=${geminiResult.ok ? geminiResult.rows.length + ' rows' : 'failed'} claude=${claudeResult.ok ? claudeResult.rows.length + ' rows' : 'failed'} openai=${openaiResult.ok ? openaiResult.rows.length + ' rows' : 'failed'} chose=${chosen.vendor}`);
+        }
+      }
+    } else {
+      try {
+        const { rows: rowsOut, ledgerDate } = await structureTranscript(pastedText, [], mode);
+        chosen = { vendor: 'gemini-flash-latest (structuring only)', modelUsed: 'gemini-flash-latest (structuring only)', rows: rowsOut, ledgerDate };
+      } catch (err) {
+        console.error('[ocr/transcribe] pasted-text structuring failed:', err.message);
+        return res.json({ rows: [], ledgerDate: null, modelUsed: null, extractionFailed: true });
+      }
+    }
+
+    const flatRows = chosen.rows.map((row) => ({
+      description: row.description || '',
+      quantity: safeParsedNumber(row.quantity) || 1,
+      amount: safeParsedNumber(row.amount),
+    }));
+
+    res.json({ rows: flatRows, ledgerDate: chosen.ledgerDate || null, modelUsed: chosen.modelUsed });
+  } catch (err) {
+    console.error('[ocr/transcribe] error:', err);
+    res.json({ rows: [], ledgerDate: null, modelUsed: null, extractionFailed: true });
+  }
+});
+
+// STAGE 2 — takes the owner-edited rows from the flat page (no image, no
+// AI vision call needed) and does inventory matching + category/expiry
+// inference + price-mismatch checks. This is what "Continue" from the flat
+// page calls, landing on the existing review sheet.
+app.post('/ocr/parse-page', requireAuth, ocrRateLimit, async (req, res) => {
+  const { rows: inputRows, mode, ledgerDate: inputLedgerDate } = req.body;
+  if (!Array.isArray(inputRows) || inputRows.length === 0) {
+    return res.status(400).json({ error: 'rows must be a non-empty array' });
+  }
+
+  try {
     const categoryRows = await pool.query(
       `SELECT COALESCE(c.name, i.name) AS category
        FROM (SELECT name FROM categories WHERE business_id = $1) c
@@ -2430,135 +2594,36 @@ app.post('/ocr/parse-page', requireAuth, ocrRateLimit, async (req, res) => {
     );
     const knownCategories = categoryRows.rows.map((r) => r.category);
 
-    // One vendor's full two-pass attempt: transcribe, then structure.
-    // Never throws — always returns a result object, so multiple vendors
-    // can be attempted and compared rather than one only kicking in once
-    // another has hard-failed.
-    async function runTwoPass(transcribeFn, vendorLabel) {
-      let rawText;
-      try {
-        rawText = await transcribeFn();
-      } catch (err) {
-        return { ok: false, vendor: vendorLabel, error: err.message, transient: err.transient };
+    // One lightweight text-only call fills in category/expiry/batch for the
+    // now-finalized rows. Cheap next to the vision pass, and only run once
+    // per confirmed page rather than per keystroke on the flat page.
+    const asText = inputRows.map((r) => `${r.quantity} ${r.description} ₦${r.amount ?? ''}`).join('\n');
+    let enriched = inputRows.map((r) => ({ ...r, category: null, expiryDate: null, batchNumber: null }));
+    try {
+      const { rows: structuredRows } = await structureTranscript(asText, knownCategories, mode);
+      if (structuredRows.length === enriched.length) {
+        enriched = enriched.map((r, i) => ({
+          ...r,
+          category: structuredRows[i].category || null,
+          expiryDate: structuredRows[i].expiryDate || null,
+          batchNumber: structuredRows[i].batchNumber || null,
+        }));
       }
-      if (!rawText || !rawText.trim()) {
-        return { ok: false, vendor: vendorLabel, error: 'Transcription came back empty' };
-      }
-      try {
-        const { rows: rowsOut, ledgerDate } = await structureTranscript(rawText, knownCategories, mode);
-        return { ok: true, vendor: vendorLabel, modelUsed: vendorLabel, rows: rowsOut, ledgerDate, transcript: rawText };
-      } catch (err) {
-        return { ok: false, vendor: vendorLabel, error: `structuring failed: ${err.message}`, transcript: rawText };
-      }
+    } catch (err) {
+      console.warn('[ocr/parse-page] category enrichment skipped:', err.message);
     }
 
-    let chosen;
-    if (hasImage) {
-      // Fast path first: one cheap, single-pass attempt aimed at real
-      // chat-like speed on the common case (a clear, reasonably simple
-      // photo). Only trusted if it comes back with more than 1 row —
-      // anything thinner falls straight through to the proven, slower
-      // Gemini-two-pass-then-escalate chain below, same as if this
-      // attempt had never been made.
-      let fastResult = null;
-      try {
-        const { rows: fastRows, ledgerDate: fastLedgerDate } = await fastSinglePassGemini(imageBase64, mediaType, knownCategories, mode);
-        if (fastRows.length > 1) {
-          fastResult = { ok: true, vendor: 'gemini-flash-latest (fast single-pass)', modelUsed: 'gemini-flash-latest (fast single-pass)', rows: fastRows, ledgerDate: fastLedgerDate };
-          console.log(`[ocr] fast single-pass succeeded with ${fastRows.length} row(s) — skipping two-pass chain entirely`);
-        } else {
-          console.warn(`[ocr] fast single-pass thin (${fastRows.length} row(s)) — falling through to two-pass chain`);
-        }
-      } catch (err) {
-        console.warn('[ocr] fast single-pass failed, falling through to two-pass chain:', err.message);
-      }
-
-      if (fastResult) {
-        chosen = fastResult;
-      } else {
-      // Gemini first, alone — primary path while ANTHROPIC_API_KEY isn't
-      // funded yet (card declined on setup — see git history/conversation
-      // for context). Claude stays fully wired in as an escalation vendor:
-      // the moment billing is sorted, swapping the primary back is a
-      // one-line change (swap which vendor runs alone here vs. which two
-      // run in the escalation Promise.all below) — nothing else in the
-      // two-pass architecture needs to change either way.
-      const geminiResult = await runTwoPass(() => transcribeWithGemini(imageBase64, mediaType), 'gemini-flash-latest (2-pass)');
-      const isThin = (r) => !r.ok || r.rows.length <= 1;
-      if (!isThin(geminiResult)) {
-        chosen = geminiResult;
-        console.log(`[ocr] gemini succeeded with ${geminiResult.rows.length} row(s) — no escalation needed`);
-      } else {
-        // Gemini failed outright, or came back suspiciously thin (<=1 row
-        // -- the exact symptom that motivated this rebuild). Escalate to
-        // both remaining vendors in parallel and keep whichever of all
-        // three attempts is actually most complete. Claude will simply
-        // fail fast here (no ANTHROPIC_API_KEY) and contribute nothing —
-        // harmless, not an error state for the request as a whole.
-        console.warn(`[ocr] Gemini ${geminiResult.ok ? `only found ${geminiResult.rows.length} row(s)` : `failed: ${geminiResult.error}`} — escalating to Claude + OpenAI (2-pass, parallel)`);
-        const [claudeResult, openaiResult] = await Promise.all([
-          runTwoPass(() => transcribeWithClaude(imageBase64, mediaType), 'claude-sonnet-5 (2-pass)'),
-          runTwoPass(() => transcribeWithOpenAI(imageBase64, mediaType), 'gpt-4o (2-pass)'),
-        ]);
-        const candidates = [geminiResult, claudeResult, openaiResult].filter((r) => r.ok);
-        if (candidates.length === 0) {
-          console.error('[ocr] all three vendors failed — Gemini:', geminiResult.error, '| Claude:', claudeResult.error, '| OpenAI:', openaiResult.error);
-          return res.status(502).json({
-            error: "Could not read the page — try a clearer photo, or tap 'Parse entries' again.",
-            debug: `Gemini: ${geminiResult.error} | Claude: ${claudeResult.error} | OpenAI: ${openaiResult.error}`,
-          });
-        }
-        chosen = candidates.reduce((best, cur) => (cur.rows.length > best.rows.length ? cur : best));
-        console.log(`[ocr] gemini=${geminiResult.ok ? geminiResult.rows.length + ' rows' : 'failed'} claude=${claudeResult.ok ? claudeResult.rows.length + ' rows' : 'failed'} openai=${openaiResult.ok ? openaiResult.rows.length + ' rows' : 'failed'} chose=${chosen.vendor}`);
-      }
-      } // closes: if (fastResult) { ... } else { <gemini two-pass + escalation> }
-    } else {
-      // Pasted text is already "transcribed" (typed or Google-Lens-
-      // extracted) — skip the vision step entirely and go straight to
-      // structuring.
-      try {
-        const { rows: rowsOut, ledgerDate } = await structureTranscript(pastedText, knownCategories, mode);
-        chosen = { vendor: 'gemini-flash-latest (structuring only)', modelUsed: 'gemini-flash-latest (structuring only)', rows: rowsOut, ledgerDate };
-      } catch (err) {
-        console.error('[ocr] pasted-text structuring failed:', err.message);
-        return res.status(502).json({
-          error: 'Could not parse the pasted text — check it copied over correctly',
-          debug: err.message,
-        });
-      }
-    }
-
-    const rows = chosen.rows;
-    const modelUsed = chosen.modelUsed;
-    const ledgerDate = chosen.ledgerDate || null;
-
-    // Price-mismatch threshold — anything closer than this is treated as
-    // OCR/rounding noise on the extracted digits, not a real price change.
-    // A genuine price increase from a supplier is normally a much bigger
-    // jump than reading "5,000" as "5,500" would ever produce by accident.
-    // Only checked in Recording Sales mode, against this item's actual
-    // sale_price — Stock Arrival's per-line amount is a cost, not a sale
-    // price, and is handled separately by receive-stock's own weighted-
-    // average logic.
     const PRICE_MISMATCH_THRESHOLD = 0.10;
-
     const inventory = (await pool.query('SELECT * FROM inventory_items WHERE business_id = $1', [req.user.businessId])).rows;
-    const reviewed = rows.map((row) => {
-      const match = fuzzyMatchItem(row.description, inventory);
-      // Both parsed defensively — see safeParsedNumber() above. A row whose
-      // quantity comes back corrupted/unreadable defaults to 1 rather than
-      // silently propagating a huge or nonsensical number to the review
-      // screen (or worse, to a committed sale).
+
+    const reviewed = [];
+    for (const row of enriched) {
+      const match = await fuzzyMatchItem(row.description, inventory, req.user.businessId, pool);
       const qty = safeParsedNumber(row.quantity) || 1;
       const parsedAmount = safeParsedNumber(row.amount);
       const unitPrice = match ? Number(match.item.sale_price) : null;
-      // Only pass through a date that actually matches the format we asked
-      // for — protects the frontend's <input type="date"> from receiving
-      // something malformed if the model didn't follow instructions exactly.
       const validExpiry = row.expiryDate && /^\d{4}-\d{2}-\d{2}$/.test(row.expiryDate) ? row.expiryDate : null;
-      // The receipt's own implied unit price (line total / qty) vs. what's
-      // actually on file for this item — flagged for the trader to notice
-      // and resolve, never auto-applied and never blocking the sale.
+
       let priceMismatch = null;
       if (mode !== 'stock' && match && parsedAmount && qty > 0 && unitPrice > 0) {
         const extractedUnitPrice = parsedAmount / qty;
@@ -2567,57 +2632,172 @@ app.post('/ocr/parse-page', requireAuth, ocrRateLimit, async (req, res) => {
           priceMismatch = { recordedPrice: unitPrice, extractedUnitPrice: Math.round(extractedUnitPrice) };
         }
       }
-      return {
+
+      reviewed.push({
         rawDescription: row.description,
         quantity: qty,
         amountOnPage: parsedAmount,
         suggestedCategory: row.category || null,
         suggestedExpiryDate: validExpiry,
         suggestedBatchNumber: row.batchNumber || null,
-        matchedItem: match ? { id: match.item.id, name: match.item.name, confidence: Number(match.confidence.toFixed(2)) } : null,
-        suggestedTotal: unitPrice ? unitPrice * qty : parsedAmount,
+        matchedItem: match ? { id: match.item.id, name: match.item.name, confidence: Number(match.confidence.toFixed(2)), viaAlias: !!match.viaAlias } : null,
+        // The page amount now wins as the line total, never recomputed
+        // through a rounded unit price — that rounding is what produced a
+        // ₦75,251 app total against a ₦75,250 book total.
+        suggestedTotal: parsedAmount != null ? parsedAmount : (unitPrice ? unitPrice * qty : null),
         needsReview: !match || match.confidence < 0.6,
         priceMismatch,
-      };
-    });
+      });
+    }
 
     const totalFromPage = reviewed.reduce((s, r) => s + (r.suggestedTotal || 0), 0);
-    res.json({ rows: reviewed, totalFromPage, rowCount: reviewed.length, modelUsed, ledgerDate });
+    res.json({ rows: reviewed, totalFromPage, rowCount: reviewed.length, ledgerDate: inputLedgerDate || null });
   } catch (err) {
-    console.error('[ocr] error:', err);
-    res.status(500).json({ error: 'Could not process the ledger entry', debug: err.message });
+    console.error('[ocr/parse-page] error:', err);
+    res.status(500).json({ error: 'Could not process the entries', debug: err.message });
   }
 });
 
-// After the owner/staff reviews and corrects the extracted rows in the UI,
-// this commits them as real sales — reusing the same recordSale() used by
-// manual entry and offline sync, so stock and ledgers stay consistent.
-app.post('/ocr/commit', requireAuth, async (req, res) => {
-  const { rows } = req.body; // [{ itemId, quantity, paymentMethod }]
-  if (!Array.isArray(rows) || rows.length === 0) return res.status(400).json({ error: 'rows must be a non-empty array' });
+// STAGE 3 — one atomic commit. Logs the scan (audit trail), backdates every
+// sale to the ledger date the owner set on the flat page (not "now"),
+// saves a confirmed rename as a remembered alias, and rolls back entirely
+// on any single row's failure — no more partial saves from a per-row loop.
+// UUID-shaped deterministic id from an arbitrary string — used so a given
+// (scan, item) pair always produces the SAME client_uuid on every retry,
+// which is what actually makes the sales-table ON CONFLICT DO NOTHING work
+// as a retry guard. (Not a real RFC 4122 v5 UUID — Postgres's uuid type
+// only validates the 8-4-4-4-12 hex shape, not version/variant bits, so a
+// plain SHA-256 slice is sufficient here and needs no extra dependency.)
+function deterministicUuid(seed) {
+  const hex = crypto.createHash('sha256').update(seed).digest('hex').slice(0, 32);
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
 
-  const results = [];
-  for (const row of rows) {
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-      const result = await recordSale(client, req.user.businessId, req.user.userId, {
-        itemId: row.itemId,
-        qty: row.quantity,
-        paymentMethod: row.paymentMethod || 'Cash',
-        clientUuid: row.clientUuid || `ocr-${Date.now()}-${Math.random().toString(36).slice(2)}`,
-        deductStock: row.deductStock !== false,
-      });
-      if (result.error) { await client.query('ROLLBACK'); results.push({ itemId: row.itemId, status: 'failed', error: result.error }); }
-      else { await client.query('COMMIT'); results.push({ itemId: row.itemId, status: 'recorded' }); }
-    } catch (err) {
-      await client.query('ROLLBACK');
-      results.push({ itemId: row.itemId, status: 'failed', error: 'Server error' });
-    } finally {
-      client.release();
-    }
+app.post('/ocr/commit', requireAuth, async (req, res) => {
+  const { rows, mode, ledgerDate, rawText, modelUsed, clientScanId } = req.body;
+  // rows: [{ itemId, isNew, newItemData, description, quantity, unitPrice, amountOnPage, paymentMethod, confirmedAlias }]
+  if (!Array.isArray(rows) || rows.length === 0) return res.status(400).json({ error: 'rows must be a non-empty array' });
+  if (!ledgerDate || !/^\d{4}-\d{2}-\d{2}$/.test(ledgerDate)) {
+    return res.status(400).json({ error: 'ledgerDate (YYYY-MM-DD) is required for a scanned page' });
   }
-  res.json({ results });
+  if (!clientScanId) {
+    return res.status(400).json({ error: 'clientScanId is required — generate one UUID on the client when the flat page opens, and resend the same value on any retry' });
+  }
+
+  // Anchored to noon on the ledger date (WAT, UTC+1) so timezone rounding
+  // never pushes it into the previous/next calendar day.
+  const occurredAt = new Date(`${ledgerDate}T12:00:00+01:00`);
+  const pageTotal = rows.reduce((s, r) => s + (Number(r.amountOnPage) || 0), 0);
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Replay guard: if this exact scan (by the client-generated id) was
+    // already committed — e.g. the response was lost on bad market network
+    // and the app retried — return the same success without touching
+    // anything a second time. Without this, a retry would double-record
+    // every sale and double-add every stock arrival.
+    const already = await client.query('SELECT id FROM scans WHERE business_id = $1 AND client_scan_id = $2', [req.user.businessId, clientScanId]);
+    if (already.rows.length > 0) {
+      await client.query('ROLLBACK');
+      return res.json({
+        scanId: already.rows[0].id,
+        results: rows.map((r) => ({ description: r.description, status: 'already-committed' })),
+        replay: true,
+      });
+    }
+
+    const scanResult = await client.query(
+      `INSERT INTO scans (business_id, staff_user_id, scan_type, ledger_date, raw_text, parsed_via, page_total, client_scan_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
+      [req.user.businessId, req.user.userId, mode === 'stock' ? 'stock_arrival' : 'sale', ledgerDate, rawText || null, modelUsed || null, pageTotal, clientScanId]
+    );
+    const scanId = scanResult.rows[0].id;
+
+    const results = [];
+    for (const row of rows) {
+      let itemId = row.itemId;
+
+      if (row.isNew) {
+        const nd = row.newItemData || {};
+        const sku = generateSku();
+        const created = await client.query(
+          `INSERT INTO inventory_items (business_id, sku, name, category, cost_price, sale_price, stock, stock_tracked, expiry_date, batch_number)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+          [req.user.businessId, sku, row.description, nd.category || null, nd.costPrice || 0, nd.salePrice || 0, 0, mode === 'stock', nd.expiryDate || null, nd.batchNumber || null]
+        );
+        itemId = created.rows[0].id;
+      } else if (row.confirmedAlias) {
+        await client.query(
+          `INSERT INTO item_aliases (business_id, item_id, alias_text) VALUES ($1,$2,$3)
+           ON CONFLICT (business_id, alias_text) DO UPDATE SET item_id = EXCLUDED.item_id`,
+          [req.user.businessId, itemId, normalize(row.description)]
+        );
+      }
+
+      if (mode === 'stock') {
+        const itemRow = await client.query('SELECT * FROM inventory_items WHERE id = $1 AND business_id = $2 FOR UPDATE', [itemId, req.user.businessId]);
+        const item = itemRow.rows[0];
+        if (!item) { results.push({ description: row.description, status: 'failed', error: 'Item not found' }); continue; }
+        const incomingQty = Number(row.quantity) || 0;
+        const unitCost = row.unitPrice != null ? Number(row.unitPrice) : null;
+
+        // Mirrors PATCH /inventory/:id/receive-stock exactly: weighted
+        // average only kicks in when a real, different cost was actually
+        // given — otherwise cost is left untouched, same as a delivery
+        // logged with no price change. seed_quantity tracks total ever
+        // received (separate from stock, which sales deduct from).
+        let newCost = Number(item.cost_price);
+        const costChanging = unitCost != null && unitCost > 0 && unitCost !== Number(item.cost_price);
+        if (costChanging) {
+          const oldStock = Number(item.stock);
+          newCost = oldStock > 0
+            ? Math.round(((oldStock * Number(item.cost_price)) + (incomingQty * unitCost)) / (oldStock + incomingQty) * 100) / 100
+            : unitCost;
+        }
+
+        // Expiry/batch fill only if the item doesn't already have one — a
+        // later delivery's dates never silently overwrite an earlier one's,
+        // since this model tracks one expiry per item, not per batch. This
+        // matters mainly to pharma-style businesses; most others never set
+        // these fields at all, and this is a no-op for them either way.
+        const rowExpiry = row.newItemData?.expiryDate || row.expiryDate || null;
+        const rowBatch = row.newItemData?.batchNumber || row.batchNumber || null;
+        const newExpiry = item.expiry_date ? item.expiry_date : rowExpiry;
+        const newBatch = item.batch_number ? item.batch_number : rowBatch;
+
+        await client.query(
+          `UPDATE inventory_items
+           SET stock = stock + $1, seed_quantity = seed_quantity + $1, cost_price = $2, expiry_date = $3, batch_number = $4, updated_at = now()
+           WHERE id = $5`,
+          [incomingQty, newCost, newExpiry, newBatch, itemId]
+        );
+        results.push({ description: row.description, status: 'received', itemId });
+      } else {
+        const result = await recordSale(client, req.user.businessId, req.user.userId, {
+          itemId,
+          qty: row.quantity,
+          paymentMethod: row.paymentMethod || 'Cash',
+          clientUuid: deterministicUuid(`${clientScanId}:${itemId}`),
+          occurredAt,
+          unitPrice: row.unitPrice != null ? Number(row.unitPrice) : undefined,
+          scanId,
+        });
+        if (result.error) throw new Error(`${row.description}: ${result.error}`);
+        results.push({ description: row.description, status: result.duplicate ? 'already-synced' : 'recorded', itemId });
+      }
+    }
+
+    await client.query('COMMIT');
+    res.json({ scanId, results });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('[ocr/commit] error, rolled back entirely:', err.message);
+    res.status(500).json({ error: 'Could not save the page — nothing was recorded, try again', debug: err.message });
+  } finally {
+    client.release();
+  }
 });
 
 app.post('/internal/run-daily-summary-now', async (req, res) => {
