@@ -2089,7 +2089,14 @@ const RECEIPT_PARSER_SYSTEM_PROMPT =
 // The fallback is a distinct, cheaper model family — if the primary flash
 // tier is genuinely struggling, this doesn't share the same capacity pool.
 const GEMINI_MODEL_CHAIN = ['gemini-flash-latest', 'gemini-flash-lite-latest'];
-const GEMINI_RETRY_DELAYS_MS = [1000, 2000, 4000]; // 1s, 2s, 4s between attempts
+// Shortened from [1000, 2000, 4000] — on the paid Gemini tier a stall is far
+// more likely to be a real transient server error (503) than a rate limit,
+// and this delay is paid on EVERY retry, at EVERY stage (transcribe, then
+// again on structuring) — the old total could add up to ~14s of pure
+// waiting across one failed scan before a human even sees a result. Fail
+// (or recover) faster; a human re-tapping "Try again" is itself a form of
+// retry, so the backend doesn't need to be maximally patient on its own.
+const GEMINI_RETRY_DELAYS_MS = [500, 1000, 1500]; // 0.5s, 1s, 1.5s between attempts
 
 async function callGeminiWithRetry(baseRequestBody, thinkingLevelOverride = 'medium') {
   let lastErr;
@@ -2172,14 +2179,18 @@ async function callGeminiWithRetry(baseRequestBody, thinkingLevelOverride = 'med
 // reformat known-good text, which is a far easier task to get reliably
 // right under a strict schema.
 //
-// Claude is the primary vision reader (best real-world accuracy on messy
-// handwritten pages, confirmed directly against this exact ledger in
-// conversation before this was built). Gemini and OpenAI's two-pass
-// transcriptions are only run — in parallel — if Claude's result is
-// missing, errored, or suspiciously thin (≤1 row on an image, the exact
-// symptom that motivated this rebuild), and whichever of all three
-// attempts is most complete wins. Pasted text skips vision entirely and
-// goes straight to structuring, since it's already "transcribed".
+// Gemini is the primary, funded vendor and does almost all real work: a
+// single fast schema-constrained pass first, falling through to this
+// two-pass (transcribe, then structure) chain only if that's thin. Claude
+// tested as the most accurate reader on messy handwriting in earlier
+// testing, but ANTHROPIC_API_KEY has never been funded (billing setup was
+// never completed), so it is NOT a routine second opinion — it's a
+// last-resort fallback, skipped outright (no wasted network call) when
+// unconfigured, attempted alongside OpenAI only if Gemini's own two-pass
+// chain is still thin or failed outright. Pasted text skips vision
+// entirely and goes straight to structuring, since it's already
+// "transcribed". If Anthropic billing ever gets fixed, Claude becomes a
+// real fallback again automatically — nothing else here needs to change.
 // ----------------------------------------------------------------------------
 
 const TRANSCRIBE_INSTRUCTIONS =
@@ -2460,7 +2471,11 @@ async function fastSinglePassGemini(imageBase64, mediaType, knownCategories, mod
         required: ['items'],
       },
     },
-  }, 'low');
+  }, 'medium'); // was 'low' — confirmed undershooting on real multi-line pages (a 16-line photo
+  // returned only its first line, cleanly, no error), which meant this "fast path" almost
+  // never actually won and nearly every scan fell through to the full two-pass chain below
+  // regardless of handwriting quality. 'medium' matches the two-pass transcribe call's
+  // setting, which has consistently read full pages correctly.
   const text = (aiRes.aiData.candidates?.[0]?.content?.parts || []).map((p) => p.text || '').join('').trim();
   return extractRowsFromText(text); // { rows, ledgerDate } — throws on malformed output; caller treats that as "thin", same as an empty/short result
 }
@@ -2533,14 +2548,23 @@ app.post('/ocr/transcribe', requireAuth, ocrRateLimit, async (req, res) => {
           chosen = geminiResult;
           console.log(`[ocr/transcribe] gemini succeeded with ${geminiResult.rows.length} row(s) — no escalation needed`);
         } else {
-          console.warn(`[ocr/transcribe] Gemini ${geminiResult.ok ? `only found ${geminiResult.rows.length} row(s)` : `failed: ${geminiResult.error}`} — escalating to Claude + OpenAI (2-pass, parallel)`);
+          // Gemini is the funded, default vendor — Claude/OpenAI are a true
+          // last-resort safety net now, not a routine second opinion. Claude
+          // specifically is skipped outright when ANTHROPIC_API_KEY isn't
+          // configured, rather than making (and waiting on) a network call
+          // that's certain to fail — that wasted round trip was pure dead
+          // time on every escalation, on top of already being the rare case.
+          const claudeAvailable = !!process.env.ANTHROPIC_API_KEY;
+          console.warn(`[ocr/transcribe] Gemini ${geminiResult.ok ? `only found ${geminiResult.rows.length} row(s)` : `failed: ${geminiResult.error}`} — escalating to${claudeAvailable ? ' Claude +' : ''} OpenAI (2-pass${claudeAvailable ? ', parallel' : ''})`);
           const [claudeResult, openaiResult] = await Promise.all([
-            runTwoPass(() => transcribeWithClaude(imageBase64, mediaType), 'claude-sonnet-5 (2-pass)'),
+            claudeAvailable
+              ? runTwoPass(() => transcribeWithClaude(imageBase64, mediaType), 'claude-sonnet-5 (2-pass)')
+              : Promise.resolve({ ok: false, vendor: 'claude-sonnet-5 (2-pass)', error: 'ANTHROPIC_API_KEY not configured — skipped' }),
             runTwoPass(() => transcribeWithOpenAI(imageBase64, mediaType), 'gpt-4o (2-pass)'),
           ]);
           const candidates = [geminiResult, claudeResult, openaiResult].filter((r) => r.ok);
           if (candidates.length === 0) {
-            console.error('[ocr/transcribe] all three vendors failed — Gemini:', geminiResult.error, '| Claude:', claudeResult.error, '| OpenAI:', openaiResult.error);
+            console.error('[ocr/transcribe] all vendors failed — Gemini:', geminiResult.error, '| Claude:', claudeResult.error, '| OpenAI:', openaiResult.error);
             return res.json({ rows: [], ledgerDate: null, modelUsed: null, extractionFailed: true });
           }
           chosen = candidates.reduce((best, cur) => (cur.rows.length > best.rows.length ? cur : best));
