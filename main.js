@@ -2471,11 +2471,15 @@ async function fastSinglePassGemini(imageBase64, mediaType, knownCategories, mod
         required: ['items'],
       },
     },
-  }, 'medium'); // was 'low' — confirmed undershooting on real multi-line pages (a 16-line photo
-  // returned only its first line, cleanly, no error), which meant this "fast path" almost
-  // never actually won and nearly every scan fell through to the full two-pass chain below
-  // regardless of handwriting quality. 'medium' matches the two-pass transcribe call's
-  // setting, which has consistently read full pages correctly.
+  }, 'low'); // Reverted back to 'low' after 'medium' caused a WORSE failure on a real
+  // dense page: this single call does vision + structuring + schema output all at once,
+  // so 'medium' thinking ate enough of the shared output-token budget to truncate the
+  // JSON mid-write — producing a CORRUPTED row ("One love Spray", qty 12, amount 0)
+  // instead of a clean short result, which meant it didn't trigger the safety net and
+  // got shown as if it were real. This function is currently not called at all (see the
+  // /ocr/transcribe route) — 'low' is restored here so that if it's ever re-enabled
+  // without careful review, it fails the SAFE way (clean undershoot, falls through to
+  // the two-pass chain) rather than the unsafe way this setting previously caused.
   const text = (aiRes.aiData.candidates?.[0]?.content?.parts || []).map((p) => p.text || '').join('').trim();
   return extractRowsFromText(text); // { rows, ledgerDate } — throws on malformed output; caller treats that as "thin", same as an empty/short result
 }
@@ -2526,22 +2530,22 @@ app.post('/ocr/transcribe', requireAuth, ocrRateLimit, async (req, res) => {
 
     let chosen;
     if (hasImage) {
-      let fastResult = null;
-      try {
-        const { rows: fastRows, ledgerDate: fastLedgerDate } = await fastSinglePassGemini(imageBase64, mediaType, [], mode);
-        if (fastRows.length > 1) {
-          fastResult = { ok: true, vendor: 'gemini-flash-latest (fast single-pass)', modelUsed: 'gemini-flash-latest (fast single-pass)', rows: fastRows, ledgerDate: fastLedgerDate };
-          console.log(`[ocr/transcribe] fast single-pass succeeded with ${fastRows.length} row(s)`);
-        } else {
-          console.warn(`[ocr/transcribe] fast single-pass thin (${fastRows.length} row(s)) — falling through to two-pass chain`);
-        }
-      } catch (err) {
-        console.warn('[ocr/transcribe] fast single-pass failed, falling through:', err.message);
-      }
-
-      if (fastResult) {
-        chosen = fastResult;
-      } else {
+      // Fast single-pass is currently OFF, not removed. It has now failed
+      // in two different ways at two different thinking-level settings on
+      // the exact same real page: 'low' cleanly undershoot (1 row, no
+      // error — safe, correctly fell through to the two-pass chain below);
+      // 'medium' truncated instead, because this single call does vision +
+      // structuring + full schema output at once against a tight shared
+      // token budget on a dense page, and what came out was a CORRUPTED
+      // row ("One love Spray", qty 12, amount 0) that still looked valid
+      // enough to be accepted rather than falling through. A corrupted
+      // result is worse than a thin one, because it doesn't trigger the
+      // safety net. Until there's a real way to detect "corrupted" (not
+      // just "short"), going straight to the two-pass chain — which has
+      // correctly read this same page every time it's been tried — is the
+      // reliable choice. Re-enabling this later needs a genuine
+      // truncation/corruption check, not just a row-count threshold.
+      {
         const geminiResult = await runTwoPass(() => transcribeWithGemini(imageBase64, mediaType), 'gemini-flash-latest (2-pass)');
         const isThin = (r) => !r.ok || r.rows.length <= 1;
         if (!isThin(geminiResult)) {
