@@ -2602,6 +2602,71 @@ app.post('/ocr/transcribe', requireAuth, ocrRateLimit, async (req, res) => {
 // AI vision call needed) and does inventory matching + category/expiry
 // inference + price-mismatch checks. This is what "Continue" from the flat
 // page calls, landing on the existing review sheet.
+// Speech-to-text for the line-by-line voice entry flow — speak one item,
+// see it land as a row on the flat page, speak the next. Uses Whisper
+// (already funded via OPENAI_API_KEY, no new vendor/billing needed) rather
+// than N-ATLAS, which has no public hosted API yet (self-hosting is the
+// only current option, and that's real GPU infrastructure, not a quick
+// wire-up). Whisper is strong on accented English, which is what traders
+// mostly speak in practice.
+async function transcribeAudioWithWhisper(audioBase64, mimeType) {
+  if (!process.env.OPENAI_API_KEY) {
+    const err = new Error('OPENAI_API_KEY is not configured');
+    err.transient = false;
+    throw err;
+  }
+  const buffer = Buffer.from(audioBase64, 'base64');
+  const ext = (mimeType || '').includes('mp4') ? 'mp4' : (mimeType || '').includes('ogg') ? 'ogg' : 'webm';
+  const form = new FormData();
+  form.append('file', new Blob([buffer], { type: mimeType || 'audio/webm' }), `speech.${ext}`);
+  form.append('model', 'whisper-1');
+  // Nudges Whisper toward the vocabulary it'll actually hear — item names,
+  // naira amounts — without constraining it to only these words.
+  form.append('prompt', 'Nigerian market trader reading out an item name, quantity, and price in naira, e.g. "one love spray ten thousand naira".');
+
+  const res = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
+    body: form,
+  });
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    const err = new Error(`Whisper API error (${res.status}): ${errText.slice(0, 200)}`);
+    err.transient = res.status === 429 || res.status === 503;
+    throw err;
+  }
+  const data = await res.json();
+  return data.text || '';
+}
+
+// One spoken line in, one structured row out. Deliberately thin — it
+// reuses structureTranscript exactly as the pasted-text path already does,
+// just fed a single utterance instead of a whole page, so there's no new
+// parsing logic to get wrong here, only the audio-to-text step is new.
+app.post('/ocr/transcribe-audio', requireAuth, ocrRateLimit, async (req, res) => {
+  const { audioBase64, mimeType, mode } = req.body;
+  if (!audioBase64) return res.status(400).json({ error: 'audioBase64 is required' });
+  if (!process.env.OPENAI_API_KEY) {
+    return res.status(500).json({ error: 'Voice entry is not configured on the server (OPENAI_API_KEY missing)' });
+  }
+
+  try {
+    const transcript = await transcribeAudioWithWhisper(audioBase64, mimeType);
+    if (!transcript || !transcript.trim()) {
+      return res.json({ row: null, transcript: '', error: "Didn't catch that — try again" });
+    }
+    const { rows } = await structureTranscript(transcript, [], mode);
+    const row = rows[0] || { description: transcript.trim(), quantity: 1, amount: null };
+    res.json({
+      row: { description: row.description || transcript.trim(), quantity: row.quantity || 1, amount: row.amount != null ? row.amount : null },
+      transcript,
+    });
+  } catch (err) {
+    console.error('[ocr/transcribe-audio] error:', err.message);
+    res.status(502).json({ error: 'Could not process that — try again', debug: err.message });
+  }
+});
+
 app.post('/ocr/parse-page', requireAuth, ocrRateLimit, async (req, res) => {
   const { rows: inputRows, mode, ledgerDate: inputLedgerDate } = req.body;
   if (!Array.isArray(inputRows) || inputRows.length === 0) {
