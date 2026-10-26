@@ -2657,8 +2657,16 @@ app.post('/ocr/transcribe-audio', requireAuth, ocrRateLimit, async (req, res) =>
     }
     const { rows } = await structureTranscript(transcript, [], mode);
     const row = rows[0] || { description: transcript.trim(), quantity: 1, amount: null };
+    // Same guard /ocr/transcribe already applies to the photo path —
+    // structureTranscript's output isn't guaranteed to already be clean
+    // numbers (seen as plain strings in testing), so this coerces rather
+    // than passing whatever the model returned straight through.
     res.json({
-      row: { description: row.description || transcript.trim(), quantity: row.quantity || 1, amount: row.amount != null ? row.amount : null },
+      row: {
+        description: row.description || transcript.trim(),
+        quantity: safeParsedNumber(row.quantity) || 1,
+        amount: safeParsedNumber(row.amount),
+      },
       transcript,
     });
   } catch (err) {
@@ -2963,22 +2971,41 @@ app.get('/admin/stats', requireAuth, requireSuperAdmin, async (req, res) => {
 // GET /admin/businesses — all businesses with per-business stats
 app.get('/admin/businesses', requireAuth, requireSuperAdmin, async (req, res) => {
   try {
+    // Each one-to-many relationship (items, sales, staff) is aggregated in
+    // its OWN subquery before joining to businesses. Joining inventory_items
+    // and sales to businesses directly in one query, as this used to, fans
+    // each sale out once per inventory item that business has — COUNT(DISTINCT)
+    // happens to mask this for the counts, but SUM(s.qty * s.unit_price) has
+    // no such protection, so total_revenue came out multiplied by item_count
+    // (confirmed directly: a business with 5 items showed exactly 5x real
+    // revenue). Also now excludes voided sales, matching the voided_at IS NULL
+    // convention used for revenue everywhere else in the app — these queries
+    // were the one place that convention wasn't applied.
     const result = await pool.query(`
       SELECT
         b.id, b.name, b.address, b.whatsapp_number, b.created_at,
         b.trial_ends_at, b.next_due_date, b.monthly_fee,
         u.name AS owner_name, u.phone AS owner_phone,
-        COUNT(DISTINCT i.id) AS item_count,
-        COUNT(DISTINCT s.id) AS sale_count,
-        COALESCE(SUM(s.qty * s.unit_price), 0) AS total_revenue,
-        MAX(s.occurred_at) AS last_sale_at,
-        COUNT(DISTINCT us.id) AS staff_count
+        COALESCE(inv.item_count, 0) AS item_count,
+        COALESCE(sal.sale_count, 0) AS sale_count,
+        COALESCE(sal.total_revenue, 0) AS total_revenue,
+        sal.last_sale_at,
+        COALESCE(staff.staff_count, 0) AS staff_count
       FROM businesses b
       LEFT JOIN users u ON u.business_id = b.id AND u.role = 'owner'
-      LEFT JOIN inventory_items i ON i.business_id = b.id
-      LEFT JOIN sales s ON s.business_id = b.id
-      LEFT JOIN users us ON us.business_id = b.id AND us.role = 'staff'
-      GROUP BY b.id, b.name, b.address, b.whatsapp_number, b.created_at, b.trial_ends_at, b.next_due_date, b.monthly_fee, u.name, u.phone
+      LEFT JOIN (
+        SELECT business_id, COUNT(*) AS item_count
+        FROM inventory_items GROUP BY business_id
+      ) inv ON inv.business_id = b.id
+      LEFT JOIN (
+        SELECT business_id, COUNT(*) AS sale_count,
+               SUM(qty * unit_price) AS total_revenue, MAX(occurred_at) AS last_sale_at
+        FROM sales WHERE voided_at IS NULL GROUP BY business_id
+      ) sal ON sal.business_id = b.id
+      LEFT JOIN (
+        SELECT business_id, COUNT(*) AS staff_count
+        FROM users WHERE role = 'staff' GROUP BY business_id
+      ) staff ON staff.business_id = b.id
       ORDER BY b.next_due_date ASC NULLS LAST
     `);
     res.json({ businesses: result.rows });
@@ -3039,15 +3066,21 @@ app.get('/admin/businesses/:id', requireAuth, requireSuperAdmin, async (req, res
         WHERE b.id = $1
       `, [req.params.id]),
       pool.query('SELECT name, phone FROM users WHERE business_id = $1 AND role = $2', [req.params.id, 'staff']),
+      // Excludes voided sales, same voided_at IS NULL convention used for
+      // revenue everywhere else — a voided sale showing up in "recent sales"
+      // or counting toward "times sold" here was the same gap as the list
+      // endpoint's total_revenue, just not the fan-out multiplication (this
+      // query doesn't join items and sales to the same parent, so it was
+      // never at risk of that specific bug).
       pool.query(`
         SELECT s.qty, s.unit_price, s.occurred_at, i.name AS item_name
         FROM sales s JOIN inventory_items i ON i.id = s.item_id
-        WHERE s.business_id = $1 ORDER BY s.occurred_at DESC LIMIT 10
+        WHERE s.business_id = $1 AND s.voided_at IS NULL ORDER BY s.occurred_at DESC LIMIT 10
       `, [req.params.id]),
       pool.query(`
         SELECT i.name, i.brand, i.stock, i.sale_price, COUNT(s.id) AS times_sold
         FROM inventory_items i
-        LEFT JOIN sales s ON s.item_id = i.id
+        LEFT JOIN sales s ON s.item_id = i.id AND s.voided_at IS NULL
         WHERE i.business_id = $1
         GROUP BY i.id ORDER BY times_sold DESC LIMIT 5
       `, [req.params.id]),
